@@ -343,6 +343,8 @@ def fully_fused_projection(
 def isect_tiles(
     means2d: Tensor,  # [C, N, 2] or [nnz, 2]
     radii: Tensor,  # [C, N] or [nnz]
+    conics: Tensor,  # [C, N, 3] or [nnz, 3]
+    opacities: Tensor,  # [C, N] or [nnz]
     depths: Tensor,  # [C, N] or [nnz]
     tile_size: int,
     tile_width: int,
@@ -400,6 +402,8 @@ def isect_tiles(
     tiles_per_gauss, isect_ids, flatten_ids = _make_lazy_cuda_func("isect_tiles")(
         means2d.contiguous(),
         radii.contiguous(),
+        conics.contiguous(),
+        opacities.contiguous(),
         depths.contiguous(),
         camera_ids,
         gaussian_ids,
