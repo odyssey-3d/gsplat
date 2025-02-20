@@ -9,10 +9,10 @@ pip install -e .
 # How to run
 Here is the command I would recommend to run it. Note, that's the setup for 8 GPUs. 
 --step-scaler can be set as 1/{number GPUs}
---strategy.cap-max is also per GPU. I.e. in case 4 GPUs are used, I would set it as 2600000
+--strategy.cap-max is also per GPU. I.e. in case 4 GPUs are used, I would set it as 2000000
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python examples/simple_trainer.py default --use-bilateral-grid --data-dir path --test_every 0 -restult-dir path --disable_viewer --steps-scaler 0.125 --strategy.cap-max 1300000
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python examples/simple_trainer.py mcmc --use-bilateral-grid --data-dir [/mnt/data/new_data/xplor/office_lobby/undistort] --test_every 0 --result-dir [output/office_lobby] --disable_viewer --steps-scaler 0.125 --strategy.cap-max 1000000
 ```
 In the result-dir there will be a ckpt folder and a ply folder which has multiple files (one per GPU). They can be merged with either 
 ```bash
@@ -22,7 +22,7 @@ python scripts/merge_plys.py ./results/plys ./results/merged.plys
 or 
 
 ```bash 
-python merge_pts.py --ckpts-folder ./results/ckpts --output-dir ./results/ckpts
+python scripts/merge_pts.py --ckpts-folder ./results/ckpts --output-dir ./results/ckpts
 ```
 
 The images and masks (if available) must have the following folder structure
