@@ -6,6 +6,14 @@ micromamba activate gsplat
 pip install -r examples/requirements.txt
 pip install -e .
 ```
+# Docker Container 
+```bash
+git clone --recursive git@github.com:odyssey-3d/gsplat
+docker build -t gsplat .
+docker run --gpus all -it --shm-size=16g -v /mnt/data:/mnt/data gsplat
+micromamba run -n gsplat python examples/simple_trainer.py mcmc     --use-bilateral-grid     --data-dir /mnt/data/new_data/xplor/office_lobby/undistort     --test_every 100     --result-dir output/office_lobby_group_num_neighbors     --disable_viewer     --steps-scaler 0.125     --strategy.cap-max 1000000
+
+```
 
 # How to run
 Here is the command I would recommend to run it. Note, that's the setup for 8 GPUs. 
