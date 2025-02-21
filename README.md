@@ -1,5 +1,6 @@
 # Installation
 ```bash
+git clone --recursive git@github.com:odyssey-3d/gsplat
 micromamba create -f environment.yml -y
 micromamba activate gsplat
 pip install -r examples/requirements.txt
