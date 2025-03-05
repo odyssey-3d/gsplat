@@ -4,8 +4,10 @@ from tqdm import tqdm
 from typing import Any, Dict, List, Optional
 from typing_extensions import assert_never
 
-import cv2
+import imageio.plugins.pyav
 from PIL import Image
+import cv2
+import logging
 import imageio.v2 as imageio
 import numpy as np
 import torch
@@ -182,6 +184,8 @@ class Parser:
             image_dir_suffix = ""
         colmap_image_dir = os.path.join(data_dir, "images")
         image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
+        mask_dir = os.path.join(data_dir, "masks" + image_dir_suffix)
+
         for d in [image_dir, colmap_image_dir]:
             if not os.path.exists(d):
                 raise ValueError(f"Image folder {d} does not exist.")
@@ -197,6 +201,14 @@ class Parser:
             image_files = sorted(_get_rel_paths(image_dir))
         colmap_to_image = dict(zip(colmap_files, image_files))
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
+        
+        # Only create mask paths if mask directory exists
+        image_mask_paths = []
+        if os.path.exists(mask_dir):
+            image_mask_paths = [os.path.join(mask_dir, colmap_to_image[f].replace('.jpg', '.png')) for f in image_names]
+        else:
+            print(f"Warning: Mask folder {mask_dir} does not exist. Proceeding without masks.")
+            image_mask_paths = [None] * len(image_names)
 
         # 3D points and {image_name -> [point_idx]}
         points = manager.points3D.astype(np.float32)
@@ -230,6 +242,7 @@ class Parser:
 
         self.image_names = image_names  # List[str], (num_images,)
         self.image_paths = image_paths  # List[str], (num_images,)
+        self.image_mask_paths = image_mask_paths  # List[str], (num_images,)
         self.camtoworlds = camtoworlds  # np.ndarray, (num_images, 4, 4)
         self.camera_ids = camera_ids  # List[int], (num_images,)
         self.Ks_dict = Ks_dict  # Dict of camera_id -> K
@@ -331,90 +344,214 @@ class Parser:
         self.scene_scale = np.max(dists)
 
 
+def load_image(image_path):
+    """Helper function to load images with multiple fallback options."""
+    try:
+        # First try with imageio
+        return imageio.imread(image_path)[..., :3]
+    except Exception as e:
+        try:
+            # Fallback to OpenCV
+            img = cv2.imread(image_path)
+            if img is not None:
+                return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        except Exception:
+            pass
+        
+        try:
+            # Final fallback to PIL
+            from PIL import Image
+            img = Image.open(image_path)
+            return np.array(img)[..., :3]
+        except Exception:
+            raise RuntimeError(f"Failed to load image {image_path} with all available methods") from e
+
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 class Dataset:
-    """A simple dataset class."""
+    """A simple dataset class with robust image loading and error handling."""
 
     def __init__(
         self,
-        parser: Parser,
+        parser,  # Assuming Parser is a custom class defined elsewhere
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
     ):
+        # Configure imageio to avoid PyAV issues
+        try:
+            import imageio.plugins.pyav
+            imageio.plugins.pyav.HAVE_AV = False
+        except (ImportError, AttributeError):
+            try:
+                import imageio.v2
+                imageio.v2.plugins.pyav.HAVE_AV = False
+            except (ImportError, AttributeError):
+                try:
+                    imageio.plugins.freeimage.download()  # Prefer FreeImage plugin
+                except Exception as e:
+                    logger.warning(f"Failed to configure imageio plugins: {e}")
+                    pass
+        
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
         indices = np.arange(len(self.parser.image_names))
-        if split == "train":
-            self.indices = indices[indices % self.parser.test_every != 0]
-        else:
-            self.indices = indices[indices % self.parser.test_every == 0]
+        self.indices = indices
+        if self.parser.test_every > 0:
+            if split == "train":
+                self.indices = indices[indices % self.parser.test_every != 0]
+            else:
+                self.indices = indices[indices % self.parser.test_every == 0]
 
     def __len__(self):
         return len(self.indices)
 
+    def _try_load_image(self, index: int) -> np.ndarray:
+        """Try to load an image with multiple methods."""
+        image_path = self.parser.image_paths[index]
+        
+        # Try imageio first
+        try:
+            return imageio.imread(image_path)[..., :3]
+        except Exception as e:
+            logger.warning(f"imageio failed for {image_path}: {e}")
+            
+        # Try OpenCV next
+        try:
+            img = cv2.imread(image_path)
+            if img is not None:
+                return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        except Exception as e:
+            logger.warning(f"OpenCV failed for {image_path}: {e}")
+            
+        # Try PIL as last resort
+        try:
+            img = Image.open(image_path).convert('RGB')
+            return np.array(img)
+        except Exception as e:
+            logger.warning(f"PIL failed for {image_path}: {e}")
+            
+        raise RuntimeError(f"All methods failed to load image: {image_path}")
+
+    def _load_mask(self, index: int, image_shape: tuple) -> np.ndarray:
+        """Load or create image mask with proper error handling."""
+        if self.parser.image_mask_paths[index] is not None:
+            try:
+                image_mask = imageio.imread(self.parser.image_mask_paths[index])
+                if len(image_mask.shape) == 3:
+                    if image_mask.shape[2] == 4:  # RGBA
+                        image_mask = image_mask[..., -1]  # Take alpha channel
+                    else:  # RGB
+                        image_mask = image_mask.mean(axis=2)
+                return (image_mask > 127).astype(np.uint8)
+            except Exception as e:
+                logger.warning(f"Failed to load mask {self.parser.image_mask_paths[index]}: {e}")
+        
+        # Fallback to dummy mask
+        return np.ones(image_shape[:2], dtype=np.uint8)
+
     def __getitem__(self, item: int) -> Dict[str, Any]:
-        index = self.indices[item]
-        image = imageio.imread(self.parser.image_paths[index])[..., :3]
-        camera_id = self.parser.camera_ids[index]
-        K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
-        params = self.parser.params_dict[camera_id]
-        camtoworlds = self.parser.camtoworlds[index]
-        mask = self.parser.mask_dict[camera_id]
+        """Get item with robust error handling and fallback."""
+        max_attempts = 5
+        last_exception = None
+        
+        for attempt in range(max_attempts):
+            try:
+                index = self.indices[(item + attempt) % len(self.indices)]
+                image = self._try_load_image(index)
+                image_mask = self._load_mask(index, image.shape)
+                
+                camera_id = self.parser.camera_ids[index]
+                K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
+                params = self.parser.params_dict[camera_id]
+                camtoworlds = self.parser.camtoworlds[index]
+                mask = self.parser.mask_dict[camera_id]
 
-        if len(params) > 0:
-            # Images are distorted. Undistort them.
-            mapx, mapy = (
-                self.parser.mapx_dict[camera_id],
-                self.parser.mapy_dict[camera_id],
-            )
-            image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
-            x, y, w, h = self.parser.roi_undist_dict[camera_id]
-            image = image[y : y + h, x : x + w]
+                # Undistort image if needed
+                if len(params) > 0:
+                    try:
+                        mapx, mapy = (
+                            self.parser.mapx_dict[camera_id],
+                            self.parser.mapy_dict[camera_id],
+                        )
+                        image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
+                        x, y, w, h = self.parser.roi_undist_dict[camera_id]
+                        image = image[y:y + h, x:x + w]
+                        image_mask = image_mask[y:y + h, x:x + w]
+                    except Exception as e:
+                        logger.warning(f"Failed to undistort image at index {index}: {e}")
 
-        if self.patch_size is not None:
-            # Random crop.
-            h, w = image.shape[:2]
-            x = np.random.randint(0, max(w - self.patch_size, 1))
-            y = np.random.randint(0, max(h - self.patch_size, 1))
-            image = image[y : y + self.patch_size, x : x + self.patch_size]
-            K[0, 2] -= x
-            K[1, 2] -= y
+                # Random crop if patch_size is specified
+                if self.patch_size is not None:
+                    try:
+                        h, w = image.shape[:2]
+                        max_x = max(w - self.patch_size, 1)
+                        max_y = max(h - self.patch_size, 1)
+                        x = np.random.randint(0, max_x)
+                        y = np.random.randint(0, max_y)
+                        end_x = min(x + self.patch_size, w)
+                        end_y = min(y + self.patch_size, h)
+                        image = image[y:end_y, x:end_x]
+                        image_mask = image_mask[y:end_y, x:end_x]
+                        K[0, 2] -= x
+                        K[1, 2] -= y
+                    except Exception as e:
+                        logger.warning(f"Failed to crop image at index {index}: {e}")
 
-        data = {
-            "K": torch.from_numpy(K).float(),
-            "camtoworld": torch.from_numpy(camtoworlds).float(),
-            "image": torch.from_numpy(image).float(),
-            "image_id": item,  # the index of the image in the dataset
-        }
-        if mask is not None:
-            data["mask"] = torch.from_numpy(mask).bool()
+                # Prepare base data dictionary
+                data = {
+                    "K": torch.from_numpy(K).float(),
+                    "camtoworld": torch.from_numpy(camtoworlds).float(),
+                    "image": torch.from_numpy(image).float(),
+                    "image_mask": ~torch.from_numpy(image_mask).bool(),
+                    "image_id": item,
+                }
+                
+                if mask is not None:
+                    data["mask"] = torch.from_numpy(mask).bool()
 
-        if self.load_depths:
-            # projected points to image plane to get depths
-            worldtocams = np.linalg.inv(camtoworlds)
-            image_name = self.parser.image_names[index]
-            point_indices = self.parser.point_indices[image_name]
-            points_world = self.parser.points[point_indices]
-            points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
-            points_proj = (K @ points_cam.T).T
-            points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
-            depths = points_cam[:, 2]  # (M,)
-            # filter out points outside the image
-            selector = (
-                (points[:, 0] >= 0)
-                & (points[:, 0] < image.shape[1])
-                & (points[:, 1] >= 0)
-                & (points[:, 1] < image.shape[0])
-                & (depths > 0)
-            )
-            points = points[selector]
-            depths = depths[selector]
-            data["points"] = torch.from_numpy(points).float()
-            data["depths"] = torch.from_numpy(depths).float()
+                # Handle depth computation
+                if self.load_depths:
+                    try:
+                        worldtocams = np.linalg.inv(camtoworlds)
+                        image_name = self.parser.image_names[index]
+                        point_indices = self.parser.point_indices[image_name]
+                        points_world = self.parser.points[point_indices]
+                        points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
+                        points_proj = (K @ points_cam.T).T
+                        points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
+                        depths = points_cam[:, 2]  # (M,)
+                        
+                        selector = (
+                            (points[:, 0] >= 0)
+                            & (points[:, 0] < image.shape[1])
+                            & (points[:, 1] >= 0)
+                            & (points[:, 1] < image.shape[0])
+                            & (depths > 0)
+                        )
+                        points = points[selector]
+                        depths = depths[selector]
+                        
+                        data["points"] = torch.from_numpy(points).float()
+                        data["depths"] = torch.from_numpy(depths).float()
+                    except Exception as e:
+                        logger.warning(f"Failed to compute depths at index {index}: {e}")
+                        data["points"] = torch.zeros((0, 2), dtype=torch.float32)
+                        data["depths"] = torch.zeros(0, dtype=torch.float32)
 
-        return data
+                return data
+
+            except Exception as e:
+                last_exception = e
+                logger.warning(f"Attempt {attempt + 1}/{max_attempts} failed at index {index}: {e}")
+                if attempt == max_attempts - 1:
+                    logger.error(f"Exhausted all attempts starting from index {item}: {last_exception}")
+                    raise RuntimeError(f"Failed after {max_attempts} attempts starting from index {item}")
+                continue
 
 
 if __name__ == "__main__":

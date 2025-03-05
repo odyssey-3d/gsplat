@@ -1,3 +1,52 @@
+# Installation
+```bash
+git clone --recursive git@github.com:odyssey-3d/gsplat
+micromamba create -f environment.yml -y
+micromamba activate gsplat
+pip install -r examples/requirements.txt
+pip install -e .
+```
+# Docker Container 
+```bash
+git clone --recursive git@github.com:odyssey-3d/gsplat
+docker build -t gsplat .
+docker run --gpus all -it --shm-size=16g -v /mnt/data:/mnt/data gsplat
+micromamba run -n gsplat python examples/simple_trainer.py default --use-bilateral-grid --data-dir /mnt/data/tahao/ --result-dir /mnt/data/tahao_output --disable_viewer --steps-scaler 0.125 
+
+```
+
+# How to run
+Here is the command I would recommend to run it. Note, that's the setup for 8 GPUs. 
+--step-scaler MUST be set as 1/{number GPUs}
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python examples/simple_trainer.py mcmc --use-bilateral-grid --data-dir [/mnt/data/new_data/xplor/office_lobby/undistort] --test_every 0 --result-dir [output/office_lobby] --disable_viewer --steps-scaler 0.125 --strategy.cap-max 1000000
+```
+In the result-dir there will be a ckpt folder which has multiple files (one per GPU). They can be merged with  
+
+```bash 
+python scripts/merge_pts.py --ckpts-folder ./results/ckpts --output-dir ./results/ckpts
+```
+
+The images and masks (if available) must have the following folder structure
+```bash
+├── images
+│   └── L2PRO (or othere device)
+│       ├── camera_0
+│       └── camera_1
+├── masks
+│   └── L2PRO (or other device, must be consistent with images folder)
+│       ├── camera_0
+│       └── camera_1
+├── sparse
+│   └── 0
+│       ├── cameras.bin
+│       ├── images.bin
+│       └── points3D.bin
+```
+Attention, the colmap loading dependency has a bug and does not properly work with the txt format. Only *.bin are working properly.
+
+
 # gsplat
 
 [![Core Tests.](https://github.com/nerfstudio-project/gsplat/actions/workflows/core_tests.yml/badge.svg?branch=main)](https://github.com/nerfstudio-project/gsplat/actions/workflows/core_tests.yml)

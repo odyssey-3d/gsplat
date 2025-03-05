@@ -497,6 +497,8 @@ def rasterization(
     tiles_per_gauss, isect_ids, flatten_ids = isect_tiles(
         means2d,
         radii,
+        conics,
+        opacities,
         depths,
         tile_size,
         tile_width,
@@ -676,6 +678,8 @@ def _rasterization(
     tiles_per_gauss, isect_ids, flatten_ids = isect_tiles(
         means2d,
         radii,
+        conics,
+        opacities,
         depths,
         tile_size,
         tile_width,

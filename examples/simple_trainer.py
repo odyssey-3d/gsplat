@@ -5,9 +5,9 @@ import time
 from dataclasses import dataclass, field
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
-
 import imageio
 import nerfview
+import open3d as o3d
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -15,6 +15,7 @@ import tqdm
 import tyro
 import viser
 import yaml
+from pathlib import Path
 from datasets.colmap import Dataset, Parser
 from datasets.traj import (
     generate_interpolated_path,
@@ -41,7 +42,6 @@ from gsplat.distributed import cli
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat.optimizers import SelectiveAdam
-from gsplat.utils import save_ply
 
 
 @dataclass
@@ -56,13 +56,13 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/garden"
+    data_dir: str = "/home/paja/new_data/xplor/beach_structure/undistort/"
     # Downsample factor for the dataset
-    data_factor: int = 4
+    data_factor: int = 1
     # Directory to save results
-    result_dir: str = "results/garden"
+    result_dir: str = "results/office_lobby_new"
     # Every N images there is a test image
-    test_every: int = 8
+    test_every: int = -1
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -83,13 +83,9 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
-    # Whether to save ply file (storage size can be large)
-    save_ply: bool = False
-    # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [30_000])
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -130,9 +126,9 @@ class Config:
     random_bkgd: bool = False
 
     # Opacity regularization
-    opacity_reg: float = 0.0
+    opacity_reg: float = 0.01
     # Scale regularization
-    scale_reg: float = 0.0
+    scale_reg: float = 0.001
 
     # Enable camera optimization.
     pose_opt: bool = False
@@ -153,7 +149,7 @@ class Config:
     app_opt_reg: float = 1e-6
 
     # Enable bilateral grid. (experimental)
-    use_bilateral_grid: bool = False
+    use_bilateral_grid: bool = True
     # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
@@ -172,7 +168,6 @@ class Config:
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
-        self.ply_steps = [int(i * factor) for i in self.ply_steps]
         self.max_steps = int(self.max_steps * factor)
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
@@ -182,6 +177,7 @@ class Config:
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.reset_every = int(strategy.reset_every * factor)
             strategy.refine_every = int(strategy.refine_every * factor)
+            strategy.growth_stop_iter = (strategy.growth_stop_iter * factor)
         elif isinstance(strategy, MCMCStrategy):
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
@@ -189,6 +185,166 @@ class Config:
         else:
             assert_never(strategy)
 
+def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = None):
+    print(f"Saving ply to {dir}")
+
+    # Convert all tensors to numpy arrays
+    numpy_data = {k: v.detach().cpu().numpy() for k, v in splats.items()}
+
+    # Extract data arrays
+    means = numpy_data["means"]
+    scales = numpy_data["scales"]
+    quats = numpy_data["quats"]
+    opacities = numpy_data["opacities"]
+
+    # Remove outliers based on position
+    mean_pos = np.mean(means, axis=0)
+    distances = np.linalg.norm(means - mean_pos, axis=1)
+    std_dist = np.std(distances)
+    inliers = distances <= 3 * std_dist  # Points within 3 standard deviations
+
+    # Filter all data arrays
+    means = means[inliers]
+    scales = scales[inliers]
+    quats = quats[inliers]
+    opacities = opacities[inliers]
+
+    # Handle colors or spherical harmonics
+    if colors is not None:
+        colors = colors.detach().cpu().numpy()[inliers]
+    else:
+        sh0 = numpy_data["sh0"][inliers].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
+        shN = numpy_data["shN"][inliers].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
+
+    # Initialize ply_data
+    ply_data = {
+        "positions": o3d.core.Tensor(means, dtype=o3d.core.Dtype.Float32),
+        "normals": o3d.core.Tensor(np.zeros_like(means), dtype=o3d.core.Dtype.Float32),
+    }
+
+    # Add features
+    if colors is not None:
+        # Use provided colors, converted to SH-like DC
+        for j in range(colors.shape[1]):
+            ply_data[f"f_dc_{j}"] = o3d.core.Tensor(
+                (colors[:, j : j + 1] - 0.5) / 0.2820947917738781,
+                dtype=o3d.core.Dtype.Float32,
+            )
+    else:
+        # Use spherical harmonics
+        for j in range(sh0.shape[1]):
+            ply_data[f"f_dc_{j}"] = o3d.core.Tensor(
+                sh0[:, j : j + 1], dtype=o3d.core.Dtype.Float32
+            )
+        for j in range(shN.shape[1]):
+            ply_data[f"f_rest_{j}"] = o3d.core.Tensor(
+                shN[:, j : j + 1], dtype=o3d.core.Dtype.Float32
+            )
+
+    # Add opacity
+    ply_data["opacity"] = o3d.core.Tensor(
+        opacities.reshape(-1, 1), dtype=o3d.core.Dtype.Float32
+    )
+
+    # Add scales
+    for i in range(scales.shape[1]):
+        ply_data[f"scale_{i}"] = o3d.core.Tensor(
+            scales[:, i : i + 1], dtype=o3d.core.Dtype.Float32
+        )
+
+    # Add rotations
+    for i in range(quats.shape[1]):
+        ply_data[f"rot_{i}"] = o3d.core.Tensor(
+            quats[:, i : i + 1], dtype=o3d.core.Dtype.Float32
+        )
+
+    # Create point cloud
+    pcd = o3d.t.geometry.PointCloud(ply_data)
+    success = o3d.t.io.write_point_cloud(dir, pcd)
+    assert success, "Could not save ply file."
+
+def merge_checkpoints(ckpts_folder: str, output_dir: str = None):
+    """
+    Load and merge checkpoint files from a folder into PLY files, filtering out invalid Gaussians.
+    """
+    ckpts_folder = Path(ckpts_folder)
+    if not ckpts_folder.exists():
+        raise ValueError(f"Checkpoint folder does not exist: {ckpts_folder}")
+
+    # If no output directory specified, create a 'merged_ply' folder next to ckpts
+    if output_dir is None:
+        output_dir = ckpts_folder.parent / "merged_ply"
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
+
+    # Find all checkpoint files
+    ckpt_files = list(ckpts_folder.glob("ckpt_*_rank*.pt"))
+    if not ckpt_files:
+        raise ValueError(f"No checkpoint files found in: {ckpts_folder}")
+
+    # Group by step
+    step_groups = defaultdict(list)
+    for ckpt_file in ckpt_files:
+        # Format assumed: ckpt_STEP_rankX.pt
+        step = int(ckpt_file.name.split('_')[1])
+        step_groups[step].append(ckpt_file)
+
+    print(f"Found checkpoints for {len(step_groups)} steps: {sorted(step_groups.keys())}")
+
+    # Process each step
+    for step, files in sorted(step_groups.items()):
+        print(f"\nProcessing step {step}...")
+        print(f"Found {len(files)} rank files:")
+        for f in files:
+            print(f"  {f}")
+
+        # Load all checkpoints
+        ckpts = [torch.load(f, map_location='cpu') for f in files]
+
+        # Create a new ParameterDict to store merged parameters
+        merged_splats = torch.nn.ParameterDict()
+
+        # Merge data for each key
+        for key in ckpts[0]['splats'].keys():
+            merged_data = torch.cat([ckpt['splats'][key] for ckpt in ckpts])
+            merged_splats[key] = torch.nn.Parameter(merged_data)
+
+        # Filter out any Gaussians that are NaN or Inf
+        num_gaussians = merged_splats['means'].shape[0]
+        valid_mask = torch.ones(num_gaussians, dtype=torch.bool)
+        for attr in merged_splats.values():
+            valid_mask = valid_mask & torch.isfinite(attr).view(attr.shape[0], -1).all(dim=1)
+
+        # Apply mask
+        filtered_splats = torch.nn.ParameterDict({
+            key: torch.nn.Parameter(attr[valid_mask]) for key, attr in merged_splats.items()
+        })
+
+        num_filtered = valid_mask.sum().item()
+        print(f"Filtered out {num_gaussians - num_filtered} invalid Gaussians out of {num_gaussians}")
+
+        # Save to .ply
+        output_ply = output_dir / f"gaussian_step_{step}.ply"
+        save_ply(filtered_splats, str(output_ply))
+        print(f"Successfully saved merged PLY to {output_ply}")
+
+def save_step_images(pixels, image_mask, save_dir, step):
+    """
+    Save both pixels and mask for each step
+    pixels: [1,n,m,3]
+    image_mask: [1,n,m,1]
+    """
+    # Create directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Convert pixels to uint8 image format (multiply by 255 since they were divided earlier)
+    pixels_img = (pixels[0].detach().cpu().numpy() * 255).astype(np.uint8)
+    # Convert mask to binary uint8 format
+    mask_img = (image_mask[0].detach().cpu().numpy() * 255).astype(np.uint8)
+    
+    # Save both images
+    imageio.imwrite(os.path.join(save_dir, f'step_{step:04d}_image.png'), pixels_img)
+    imageio.imwrite(os.path.join(save_dir, f'step_{step:04d}_mask.png'), mask_img[..., 0])  # Remove single channel dimension
 
 def create_splats_with_optimizers(
     parser: Parser,
@@ -232,18 +388,18 @@ def create_splats_with_optimizers(
 
     params = [
         # name, value, lr
-        ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
-        ("scales", torch.nn.Parameter(scales), 5e-3),
+        ("means", torch.nn.Parameter(points), 5e-5 * scene_scale),
+        ("scales", torch.nn.Parameter(scales), 8e-3),
         ("quats", torch.nn.Parameter(quats), 1e-3),
-        ("opacities", torch.nn.Parameter(opacities), 5e-2),
+        ("opacities", torch.nn.Parameter(opacities), 3e-2),
     ]
 
     if feature_dim is None:
         # color is SH coefficients.
         colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
         colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), 2.5e-3))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), 2.5e-3 / 20))
+        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), 3e-3))
+        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), 3e-3 / 20))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
@@ -300,8 +456,6 @@ class Runner:
         os.makedirs(self.stats_dir, exist_ok=True)
         self.render_dir = f"{cfg.result_dir}/renders"
         os.makedirs(self.render_dir, exist_ok=True)
-        self.ply_dir = f"{cfg.result_dir}/ply"
-        os.makedirs(self.ply_dir, exist_ok=True)
 
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
@@ -521,7 +675,10 @@ class Runner:
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
+                self.optimizers["means"], gamma=0.008 ** (1.0 / max_steps)
+            ),
+            torch.optim.lr_scheduler.ExponentialLR(
+                self.optimizers["scales"], gamma=0.375 ** (1.0 / max_steps)
             ),
         ]
         if cfg.pose_opt:
@@ -575,8 +732,14 @@ class Runner:
                 data = next(trainloader_iter)
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
+            image_mask = None
+            if image_mask in data:
+                image_mask = data["image_mask"].to(device)
+                image_mask = image_mask.permute(1,2,0).unsqueeze(0)
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            #assert pixels.shape == image_mask.shape, f"pixels.shape {pixels.shape}, image_mask.shape {image_mask.shape}"
+            #save_step_images(pixels, image_mask, ".", step)
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
@@ -615,6 +778,9 @@ class Runner:
             else:
                 colors, depths = renders, None
 
+            if image_mask is not None:
+                colors = colors * image_mask
+                pixels = pixels * image_mask
             if cfg.use_bilateral_grid:
                 grid_y, grid_x = torch.meshgrid(
                     (torch.arange(height, device=self.device) + 0.5) / height,
@@ -743,24 +909,6 @@ class Runner:
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
-            if (
-                step in [i - 1 for i in cfg.ply_steps]
-                or step == max_steps - 1
-                and cfg.save_ply
-            ):
-                rgb = None
-                if self.cfg.app_opt:
-                    # eval at origin to bake the appeareance into the colors
-                    rgb = self.app_module(
-                        features=self.splats["features"],
-                        embed_ids=None,
-                        dirs=torch.zeros_like(self.splats["means"][None, :, :]),
-                        sh_degree=sh_degree_to_use,
-                    )
-                    rgb = rgb + self.splats["colors"]
-                    rgb = torch.sigmoid(rgb).squeeze(0)
-
-                save_ply(self.splats, f"{self.ply_dir}/point_cloud_{step}.ply", rgb)
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
@@ -812,6 +960,7 @@ class Runner:
                     params=self.splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,
+                    lr=schedulers[0].get_last_lr()[0],
                     step=step,
                     info=info,
                     packed=cfg.packed,
@@ -829,9 +978,8 @@ class Runner:
                 assert_never(self.cfg.strategy)
 
             # eval the full set
-            if step in [i - 1 for i in cfg.eval_steps]:
+            if step in [i - 1 for i in cfg.eval_steps] and cfg.test_every > 0:
                 self.eval(step)
-                self.render_traj(step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -930,78 +1078,6 @@ class Runner:
             self.writer.flush()
 
     @torch.no_grad()
-    def render_traj(self, step: int):
-        """Entry for trajectory rendering."""
-        print("Running trajectory rendering...")
-        cfg = self.cfg
-        device = self.device
-
-        camtoworlds_all = self.parser.camtoworlds[5:-5]
-        if cfg.render_traj_path == "interp":
-            camtoworlds_all = generate_interpolated_path(
-                camtoworlds_all, 1
-            )  # [N, 3, 4]
-        elif cfg.render_traj_path == "ellipse":
-            height = camtoworlds_all[:, 2, 3].mean()
-            camtoworlds_all = generate_ellipse_path_z(
-                camtoworlds_all, height=height
-            )  # [N, 3, 4]
-        elif cfg.render_traj_path == "spiral":
-            camtoworlds_all = generate_spiral_path(
-                camtoworlds_all,
-                bounds=self.parser.bounds * self.scene_scale,
-                spiral_scale_r=self.parser.extconf["spiral_radius_scale"],
-            )
-        else:
-            raise ValueError(
-                f"Render trajectory type not supported: {cfg.render_traj_path}"
-            )
-
-        camtoworlds_all = np.concatenate(
-            [
-                camtoworlds_all,
-                np.repeat(
-                    np.array([[[0.0, 0.0, 0.0, 1.0]]]), len(camtoworlds_all), axis=0
-                ),
-            ],
-            axis=1,
-        )  # [N, 4, 4]
-
-        camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
-        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
-        width, height = list(self.parser.imsize_dict.values())[0]
-
-        # save to video
-        video_dir = f"{cfg.result_dir}/videos"
-        os.makedirs(video_dir, exist_ok=True)
-        writer = imageio.get_writer(f"{video_dir}/traj_{step}.mp4", fps=30)
-        for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
-            camtoworlds = camtoworlds_all[i : i + 1]
-            Ks = K[None]
-
-            renders, _, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                render_mode="RGB+ED",
-            )  # [1, H, W, 4]
-            colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
-            depths = renders[..., 3:4]  # [1, H, W, 1]
-            depths = (depths - depths.min()) / (depths.max() - depths.min())
-            canvas_list = [colors, depths.repeat(1, 1, 1, 3)]
-
-            # write images
-            canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-            canvas = (canvas * 255).astype(np.uint8)
-            writer.append_data(canvas)
-        writer.close()
-        print(f"Video saved to {video_dir}/traj_{step}.mp4")
-
-    @torch.no_grad()
     def run_compression(self, step: int):
         """Entry for running compression."""
         print("Running compression...")
@@ -1048,21 +1124,33 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
 
     runner = Runner(local_rank, world_rank, world_size, cfg)
 
-    if cfg.ckpt is not None:
-        # run eval only
-        ckpts = [
-            torch.load(file, map_location=runner.device, weights_only=True)
-            for file in cfg.ckpt
-        ]
-        for k in runner.splats.keys():
-            runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
-        step = ckpts[0]["step"]
-        runner.eval(step=step)
-        runner.render_traj(step=step)
-        if cfg.compression is not None:
-            runner.run_compression(step=step)
-    else:
-        runner.train()
+    try:
+        if cfg.ckpt is not None:
+            # run eval only
+            ckpts = [
+                torch.load(file, map_location=runner.device, weights_only=True)
+                for file in cfg.ckpt
+            ]
+            for k in runner.splats.keys():
+                runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+            step = ckpts[0]["step"]
+            if cfg.test_every > 0:
+                runner.eval(step=step)
+            if cfg.compression is not None:
+                runner.run_compression(step=step)
+        else:
+            runner.train()
+    except:
+        print("Dataloader not terminated properly")
+
+    if world_size > 1 and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+    # Merge to .ply only on rank 0
+    if world_rank == 0:
+        print("Merging checkpoints into PLY...")
+        merge_checkpoints(f"{cfg.result_dir}/ckpts")
+        print("Merging complete.")
 
     if not cfg.disable_viewer:
         print("Viewer running... Ctrl+C to exit.")
@@ -1096,8 +1184,8 @@ if __name__ == "__main__":
             Config(
                 init_opa=0.5,
                 init_scale=0.1,
-                opacity_reg=0.01,
-                scale_reg=0.01,
+                opacity_reg=0.001, # opacity reg down removes black floaters
+                scale_reg=0.05, # scale_reg up helps to regulate huge splats
                 strategy=MCMCStrategy(verbose=True),
             ),
         ),
