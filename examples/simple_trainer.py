@@ -5,9 +5,9 @@ import time
 from dataclasses import dataclass, field
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
-
 import imageio
 import nerfview
+import open3d as o3d
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -15,6 +15,7 @@ import tqdm
 import tyro
 import viser
 import yaml
+from pathlib import Path
 from datasets.colmap import Dataset, Parser
 from datasets.traj import (
     generate_interpolated_path,
@@ -183,6 +184,149 @@ class Config:
             strategy.refine_every = int(strategy.refine_every * factor)
         else:
             assert_never(strategy)
+
+def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = None):
+    print(f"Saving ply to {dir}")
+
+    # Convert all tensors to numpy arrays
+    numpy_data = {k: v.detach().cpu().numpy() for k, v in splats.items()}
+
+    # Extract data arrays
+    means = numpy_data["means"]
+    scales = numpy_data["scales"]
+    quats = numpy_data["quats"]
+    opacities = numpy_data["opacities"]
+
+    # Remove outliers based on position
+    mean_pos = np.mean(means, axis=0)
+    distances = np.linalg.norm(means - mean_pos, axis=1)
+    std_dist = np.std(distances)
+    inliers = distances <= 3 * std_dist  # Points within 3 standard deviations
+
+    # Filter all data arrays
+    means = means[inliers]
+    scales = scales[inliers]
+    quats = quats[inliers]
+    opacities = opacities[inliers]
+
+    # Handle colors or spherical harmonics
+    if colors is not None:
+        colors = colors.detach().cpu().numpy()[inliers]
+    else:
+        sh0 = numpy_data["sh0"][inliers].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
+        shN = numpy_data["shN"][inliers].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
+
+    # Initialize ply_data
+    ply_data = {
+        "positions": o3d.core.Tensor(means, dtype=o3d.core.Dtype.Float32),
+        "normals": o3d.core.Tensor(np.zeros_like(means), dtype=o3d.core.Dtype.Float32),
+    }
+
+    # Add features
+    if colors is not None:
+        # Use provided colors, converted to SH-like DC
+        for j in range(colors.shape[1]):
+            ply_data[f"f_dc_{j}"] = o3d.core.Tensor(
+                (colors[:, j : j + 1] - 0.5) / 0.2820947917738781,
+                dtype=o3d.core.Dtype.Float32,
+            )
+    else:
+        # Use spherical harmonics
+        for j in range(sh0.shape[1]):
+            ply_data[f"f_dc_{j}"] = o3d.core.Tensor(
+                sh0[:, j : j + 1], dtype=o3d.core.Dtype.Float32
+            )
+        for j in range(shN.shape[1]):
+            ply_data[f"f_rest_{j}"] = o3d.core.Tensor(
+                shN[:, j : j + 1], dtype=o3d.core.Dtype.Float32
+            )
+
+    # Add opacity
+    ply_data["opacity"] = o3d.core.Tensor(
+        opacities.reshape(-1, 1), dtype=o3d.core.Dtype.Float32
+    )
+
+    # Add scales
+    for i in range(scales.shape[1]):
+        ply_data[f"scale_{i}"] = o3d.core.Tensor(
+            scales[:, i : i + 1], dtype=o3d.core.Dtype.Float32
+        )
+
+    # Add rotations
+    for i in range(quats.shape[1]):
+        ply_data[f"rot_{i}"] = o3d.core.Tensor(
+            quats[:, i : i + 1], dtype=o3d.core.Dtype.Float32
+        )
+
+    # Create point cloud
+    pcd = o3d.t.geometry.PointCloud(ply_data)
+    success = o3d.t.io.write_point_cloud(dir, pcd)
+    assert success, "Could not save ply file."
+
+def merge_checkpoints(ckpts_folder: str, output_dir: str = None):
+    """
+    Load and merge checkpoint files from a folder into PLY files, filtering out invalid Gaussians.
+    """
+    ckpts_folder = Path(ckpts_folder)
+    if not ckpts_folder.exists():
+        raise ValueError(f"Checkpoint folder does not exist: {ckpts_folder}")
+
+    # If no output directory specified, create a 'merged_ply' folder next to ckpts
+    if output_dir is None:
+        output_dir = ckpts_folder.parent / "merged_ply"
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
+
+    # Find all checkpoint files
+    ckpt_files = list(ckpts_folder.glob("ckpt_*_rank*.pt"))
+    if not ckpt_files:
+        raise ValueError(f"No checkpoint files found in: {ckpts_folder}")
+
+    # Group by step
+    step_groups = defaultdict(list)
+    for ckpt_file in ckpt_files:
+        # Format assumed: ckpt_STEP_rankX.pt
+        step = int(ckpt_file.name.split('_')[1])
+        step_groups[step].append(ckpt_file)
+
+    print(f"Found checkpoints for {len(step_groups)} steps: {sorted(step_groups.keys())}")
+
+    # Process each step
+    for step, files in sorted(step_groups.items()):
+        print(f"\nProcessing step {step}...")
+        print(f"Found {len(files)} rank files:")
+        for f in files:
+            print(f"  {f}")
+
+        # Load all checkpoints
+        ckpts = [torch.load(f, map_location='cpu') for f in files]
+
+        # Create a new ParameterDict to store merged parameters
+        merged_splats = torch.nn.ParameterDict()
+
+        # Merge data for each key
+        for key in ckpts[0]['splats'].keys():
+            merged_data = torch.cat([ckpt['splats'][key] for ckpt in ckpts])
+            merged_splats[key] = torch.nn.Parameter(merged_data)
+
+        # Filter out any Gaussians that are NaN or Inf
+        num_gaussians = merged_splats['means'].shape[0]
+        valid_mask = torch.ones(num_gaussians, dtype=torch.bool)
+        for attr in merged_splats.values():
+            valid_mask = valid_mask & torch.isfinite(attr).view(attr.shape[0], -1).all(dim=1)
+
+        # Apply mask
+        filtered_splats = torch.nn.ParameterDict({
+            key: torch.nn.Parameter(attr[valid_mask]) for key, attr in merged_splats.items()
+        })
+
+        num_filtered = valid_mask.sum().item()
+        print(f"Filtered out {num_gaussians - num_filtered} invalid Gaussians out of {num_gaussians}")
+
+        # Save to .ply
+        output_ply = output_dir / f"gaussian_step_{step}.ply"
+        save_ply(filtered_splats, str(output_ply))
+        print(f"Successfully saved merged PLY to {output_ply}")
 
 def save_step_images(pixels, image_mask, save_dir, step):
     """
@@ -980,21 +1124,33 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
 
     runner = Runner(local_rank, world_rank, world_size, cfg)
 
-    if cfg.ckpt is not None:
-        # run eval only
-        ckpts = [
-            torch.load(file, map_location=runner.device, weights_only=True)
-            for file in cfg.ckpt
-        ]
-        for k in runner.splats.keys():
-            runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
-        step = ckpts[0]["step"]
-        if cfg.test_every > 0:
-            runner.eval(step=step)
-        if cfg.compression is not None:
-            runner.run_compression(step=step)
-    else:
-        runner.train()
+    try:
+        if cfg.ckpt is not None:
+            # run eval only
+            ckpts = [
+                torch.load(file, map_location=runner.device, weights_only=True)
+                for file in cfg.ckpt
+            ]
+            for k in runner.splats.keys():
+                runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+            step = ckpts[0]["step"]
+            if cfg.test_every > 0:
+                runner.eval(step=step)
+            if cfg.compression is not None:
+                runner.run_compression(step=step)
+        else:
+            runner.train()
+    except:
+        print("Dataloader not terminated properly")
+
+    if world_size > 1 and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+    # Merge to .ply only on rank 0
+    if world_rank == 0:
+        print("Merging checkpoints into PLY...")
+        merge_checkpoints(f"{cfg.result_dir}/ckpts")
+        print("Merging complete.")
 
     if not cfg.disable_viewer:
         print("Viewer running... Ctrl+C to exit.")
