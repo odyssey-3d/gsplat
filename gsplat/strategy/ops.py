@@ -1,5 +1,6 @@
 import numpy as np
 from typing import Callable, Dict, List, Union
+import math
 
 import torch
 import torch.nn.functional as F
@@ -181,6 +182,95 @@ def split(
 
 
 @torch.no_grad()
+def split_edc(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    mask: Tensor,
+    revised_opacity: bool = False,
+):
+    """Inplace split the Gaussian with the given mask, adapted to mimic densify_and_split_EDC.
+
+    Args:
+        params: A dictionary of parameters (e.g., "means", "scales", "opacities", "quats").
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        state: A dictionary of extra state tensors.
+        mask: A boolean mask to select Gaussians for splitting.
+        revised_opacity: Whether to use the revised opacity formulation (arXiv:2404.06109).
+                         If False, uses EDC-like opacity reduction. Default: False.
+    """
+    device = mask.device
+    sel = torch.where(mask)[0]  # Indices of Gaussians to split
+    rest = torch.where(~mask)[0]  # Indices of Gaussians to keep unchanged
+
+    if len(sel) == 0:
+        return  # No Gaussians to split
+
+    # Compute dominant axis
+    scales_log = params["scales"][sel]  # [N, 3], log-scalings
+    max_indices = torch.argmax(scales_log, dim=1)  # [N]
+    scales = torch.exp(scales_log)  # [N, 3]
+    offset_magnitudes = 1.5 * scales[torch.arange(len(sel)), max_indices]  # [N]
+
+    # Deterministic offsets along dominant axis
+    signs = torch.tensor([1.0, -1.0], device=device).view(2, 1)  # [2, 1]
+    offsets_local = torch.zeros(2, len(sel), 3, device=device)
+    offsets_local[torch.arange(2)[:, None], torch.arange(len(sel)), max_indices] = signs * offset_magnitudes
+
+    # Rotate offsets to world space (assuming normalized_quat_to_rotmat is defined elsewhere)
+    quats = F.normalize(params["quats"][sel], dim=-1)
+    rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
+    offsets_world = torch.einsum("nij,bnj->bni", rotmats, offsets_local)  # [2, N, 3]
+    new_means = (params["means"][sel].unsqueeze(0) + offsets_world).reshape(-1, 3)  # [2N, 3]
+
+    # Adjust scaling
+    log_0_5 = math.log(0.5)
+    log_0_85 = math.log(0.85)
+    adj = torch.full((len(sel), 3), log_0_85, device=device)
+    adj[torch.arange(len(sel)), max_indices] = log_0_5
+    new_scales = scales_log + adj  # [N, 3]
+    new_scales = new_scales.repeat(2, 1)  # [2N, 3]
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        """Update parameter tensors with split values."""
+        repeats = [2] + [1] * (p.dim() - 1)
+        if name == "means":
+            p_split = new_means  # [2N, 3]
+        elif name == "scales":
+            p_split = new_scales  # [2N, 3]
+        elif name == "opacities":
+            opacity = torch.sigmoid(p[sel])
+            if revised_opacity:
+                new_opacity = 1.0 - torch.sqrt(1.0 - opacity)
+            else:
+                new_opacity = 0.6 * opacity
+            p_split_logit = torch.logit(new_opacity)
+            if p.dim() == 1:
+                p_split = p_split_logit.repeat(2)  # [2N]
+            else:
+                p_split = p_split_logit.repeat(2, 1)  # [2N, 1]
+        else:
+            p_split = p[sel].repeat(repeats)  # Adapts to p's dimensions
+        p_new = torch.cat([p[rest], p_split], dim=0)
+        p_new = torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
+        return p_new
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        """Update optimizer state."""
+        v_split = torch.zeros((2 * len(sel), *v.shape[1:]), device=device)
+        return torch.cat([v[rest], v_split], dim=0)
+
+    # Update parameters and optimizers (assuming _update_param_with_optimizer is defined)
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+
+    # Update state
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor):
+            repeats = [2] + [1] * (v.dim() - 1)
+            v_new = v[sel].repeat(repeats)
+            state[k] = torch.cat((v[rest], v_new), dim=0)
+
+@torch.no_grad()
 def remove(
     params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
     optimizers: Dict[str, torch.optim.Optimizer],
@@ -339,6 +429,7 @@ def sample_add(
         if isinstance(v, torch.Tensor):
             state[k] = torch.cat((v, v_new))
 
+
 @torch.no_grad()
 def inject_noise_to_position(
     params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
@@ -346,33 +437,67 @@ def inject_noise_to_position(
     state: Dict[str, Tensor],
     scaler: float,
 ):
-    """Inplace inject noise to positions based on covariance and opacity."""
-    device = params["means"].device
-    
-    # Calculate opacities more efficiently
     opacities = torch.sigmoid(params["opacities"].flatten())
-    
-    # Compute scaling factor for noise more efficiently 
-    with torch.cuda.amp.autocast(enabled=True):
-        op_weights = 1 / (1 + torch.exp(-100 * (1 - opacities - 0.995)))
-    
-    # Generate noise directly in the right shape
-    noise = torch.randn_like(params["means"], device=device) * scaler
-    
-    # Scale noise by opacity weights
-    noise *= op_weights.unsqueeze(-1)
-    
-    # Get covariance matrices
+    scales = torch.exp(params["scales"])
     covars, _ = quat_scale_to_covar_preci(
-        quats=params["quats"],
-        scales=torch.exp(params["scales"]),
+        params["quats"],
+        scales,
         compute_covar=True,
         compute_preci=False,
         triu=False,
     )
+
+    def op_sigmoid(x, k=100, x0=0.995):
+        return 1 / (1 + torch.exp(-k * (x - x0)))
+
+    noise = (
+        torch.randn_like(params["means"])
+        * (op_sigmoid(1 - opacities)).unsqueeze(-1)
+        * scaler
+    )
+    noise = torch.einsum("bij,bj->bi", covars, noise)
+    params["means"].add_(noise)
     
-    # Apply covariance scaling efficiently using batched operations
-    noise = torch.bmm(covars, noise.unsqueeze(-1)).squeeze(-1)
-    
-    # Update means inplace
+@torch.no_grad()
+def inject_noise_to_position_new(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, torch.Tensor],
+    scaler: float,
+):
+    """
+    Inject random noise into 'means' weighted by (1 - alpha)^100, 
+    then transform by the local covariance to preserve orientation/scale.
+
+    :param params: Dict of parameter tensors (requires ["means", "opacities", "scales", "quats"]).
+    :param optimizers: Dict of optimizers (not actually modified here).
+    :param state: Custom dictionary state (not used here).
+    :param scaler: Base scaling factor for noise.
+    """
+    # 1) Compute alpha and convert to weighting = (1 - alpha)^100
+    opacities = torch.sigmoid(params["opacities"].flatten())
+    alpha_weight = (1.0 - opacities).pow(100)
+
+    # 2) Compute local covariance for each Gaussian (orientation & scale)
+    scales = torch.exp(params["scales"])
+    covars, _ = quat_scale_to_covar_preci(
+        params["quats"],
+        scales,
+        compute_covar=True,
+        compute_preci=False,
+        triu=False,
+    )
+
+    # 3) Create noise ~ N(0,1), scale by alpha_weight and user 'scaler'
+    noise = (
+        torch.randn_like(params["means"])
+        * alpha_weight.unsqueeze(-1)
+        * scaler
+    )
+
+    # 4) Transform noise by the covariance so it respects each Gaussian's orientation
+    #    covars is shape [N,3,3], noise is [N,3]
+    noise = torch.einsum("bij,bj->bi", covars, noise)
+
+    # 5) In-place add to the means
     params["means"].add_(noise)

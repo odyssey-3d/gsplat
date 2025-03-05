@@ -61,7 +61,7 @@ class Config:
     # Directory to save results
     result_dir: str = "results/office_lobby_new"
     # Every N images there is a test image
-    test_every: int = 8
+    test_every: int = -1
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -125,9 +125,9 @@ class Config:
     random_bkgd: bool = False
 
     # Opacity regularization
-    opacity_reg: float = 0.0
+    opacity_reg: float = 0.01
     # Scale regularization
-    scale_reg: float = 0.0
+    scale_reg: float = 0.001
 
     # Enable camera optimization.
     pose_opt: bool = False
@@ -176,6 +176,7 @@ class Config:
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.reset_every = int(strategy.reset_every * factor)
             strategy.refine_every = int(strategy.refine_every * factor)
+            strategy.growth_stop_iter = (strategy.growth_stop_iter * factor)
         elif isinstance(strategy, MCMCStrategy):
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
@@ -243,18 +244,18 @@ def create_splats_with_optimizers(
 
     params = [
         # name, value, lr
-        ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
-        ("scales", torch.nn.Parameter(scales), 5e-3),
+        ("means", torch.nn.Parameter(points), 5e-5 * scene_scale),
+        ("scales", torch.nn.Parameter(scales), 8e-3),
         ("quats", torch.nn.Parameter(quats), 1e-3),
-        ("opacities", torch.nn.Parameter(opacities), 5e-2),
+        ("opacities", torch.nn.Parameter(opacities), 3e-2),
     ]
 
     if feature_dim is None:
         # color is SH coefficients.
         colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
         colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), 2.5e-3))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), 2.5e-3 / 20))
+        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), 3e-3))
+        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), 3e-3 / 20))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
@@ -530,7 +531,10 @@ class Runner:
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
+                self.optimizers["means"], gamma=0.008 ** (1.0 / max_steps)
+            ),
+            torch.optim.lr_scheduler.ExponentialLR(
+                self.optimizers["scales"], gamma=0.375 ** (1.0 / max_steps)
             ),
         ]
         if cfg.pose_opt:
@@ -812,6 +816,7 @@ class Runner:
                     params=self.splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,
+                    lr=schedulers[0].get_last_lr()[0],
                     step=step,
                     info=info,
                     packed=cfg.packed,
@@ -829,9 +834,8 @@ class Runner:
                 assert_never(self.cfg.strategy)
 
             # eval the full set
-            if step in [i - 1 for i in cfg.eval_steps]:
+            if step in [i - 1 for i in cfg.eval_steps] and cfg.test_every > 0:
                 self.eval(step)
-                self.render_traj(step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -930,78 +934,6 @@ class Runner:
             self.writer.flush()
 
     @torch.no_grad()
-    def render_traj(self, step: int):
-        """Entry for trajectory rendering."""
-        print("Running trajectory rendering...")
-        cfg = self.cfg
-        device = self.device
-
-        camtoworlds_all = self.parser.camtoworlds[5:-5]
-        if cfg.render_traj_path == "interp":
-            camtoworlds_all = generate_interpolated_path(
-                camtoworlds_all, 1
-            )  # [N, 3, 4]
-        elif cfg.render_traj_path == "ellipse":
-            height = camtoworlds_all[:, 2, 3].mean()
-            camtoworlds_all = generate_ellipse_path_z(
-                camtoworlds_all, height=height
-            )  # [N, 3, 4]
-        elif cfg.render_traj_path == "spiral":
-            camtoworlds_all = generate_spiral_path(
-                camtoworlds_all,
-                bounds=self.parser.bounds * self.scene_scale,
-                spiral_scale_r=self.parser.extconf["spiral_radius_scale"],
-            )
-        else:
-            raise ValueError(
-                f"Render trajectory type not supported: {cfg.render_traj_path}"
-            )
-
-        camtoworlds_all = np.concatenate(
-            [
-                camtoworlds_all,
-                np.repeat(
-                    np.array([[[0.0, 0.0, 0.0, 1.0]]]), len(camtoworlds_all), axis=0
-                ),
-            ],
-            axis=1,
-        )  # [N, 4, 4]
-
-        camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
-        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
-        width, height = list(self.parser.imsize_dict.values())[0]
-
-        # save to video
-        video_dir = f"{cfg.result_dir}/videos"
-        os.makedirs(video_dir, exist_ok=True)
-        writer = imageio.get_writer(f"{video_dir}/traj_{step}.mp4", fps=30)
-        for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
-            camtoworlds = camtoworlds_all[i : i + 1]
-            Ks = K[None]
-
-            renders, _, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                render_mode="RGB+ED",
-            )  # [1, H, W, 4]
-            colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
-            depths = renders[..., 3:4]  # [1, H, W, 1]
-            depths = (depths - depths.min()) / (depths.max() - depths.min())
-            canvas_list = [colors, depths.repeat(1, 1, 1, 3)]
-
-            # write images
-            canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-            canvas = (canvas * 255).astype(np.uint8)
-            writer.append_data(canvas)
-        writer.close()
-        print(f"Video saved to {video_dir}/traj_{step}.mp4")
-
-    @torch.no_grad()
     def run_compression(self, step: int):
         """Entry for running compression."""
         print("Running compression...")
@@ -1057,8 +989,8 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         for k in runner.splats.keys():
             runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
         step = ckpts[0]["step"]
-        runner.eval(step=step)
-        runner.render_traj(step=step)
+        if cfg.test_every > 0:
+            runner.eval(step=step)
         if cfg.compression is not None:
             runner.run_compression(step=step)
     else:
