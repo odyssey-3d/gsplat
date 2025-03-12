@@ -201,7 +201,7 @@ def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = No
     mean_pos = np.mean(means, axis=0)
     distances = np.linalg.norm(means - mean_pos, axis=1)
     std_dist = np.std(distances)
-    inliers = distances <= 3 * std_dist  # Points within 3 standard deviations
+    inliers = distances <= 4 * std_dist  # Points within 4 standard deviations
 
     # Filter all data arrays
     means = means[inliers]
