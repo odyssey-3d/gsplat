@@ -26,31 +26,31 @@ from .utils import depth_to_normal, get_projection_matrix
 
 
 def rasterization(
-    means: Tensor,  # [N, 3]
-    quats: Tensor,  # [N, 4]
-    scales: Tensor,  # [N, 3]
-    opacities: Tensor,  # [N]
-    colors: Tensor,  # [(C,) N, D] or [(C,) N, K, 3]
-    viewmats: Tensor,  # [C, 4, 4]
-    Ks: Tensor,  # [C, 3, 3]
-    width: int,
-    height: int,
-    near_plane: float = 0.01,
-    far_plane: float = 1e10,
-    radius_clip: float = 0.0,
-    eps2d: float = 0.3,
-    sh_degree: Optional[int] = None,
-    packed: bool = True,
-    tile_size: int = 16,
-    backgrounds: Optional[Tensor] = None,
-    render_mode: Literal["RGB", "D", "ED", "RGB+D", "RGB+ED"] = "RGB",
-    sparse_grad: bool = False,
-    absgrad: bool = False,
-    rasterize_mode: Literal["classic", "antialiased"] = "classic",
-    channel_chunk: int = 32,
-    distributed: bool = False,
-    camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
-    covars: Optional[Tensor] = None,
+        means: Tensor,  # [N, 3]
+        quats: Tensor,  # [N, 4]
+        scales: Tensor,  # [N, 3]
+        opacities: Tensor,  # [N]
+        colors: Tensor,  # [(C,) N, D] or [(C,) N, K, 3]
+        viewmats: Tensor,  # [C, 4, 4]
+        Ks: Tensor,  # [C, 3, 3]
+        width: int,
+        height: int,
+        near_plane: float = 0.01,
+        far_plane: float = 1e10,
+        radius_clip: float = 0.0,
+        eps2d: float = 0.3,
+        sh_degree: Optional[int] = None,
+        packed: bool = True,
+        tile_size: int = 16,
+        backgrounds: Optional[Tensor] = None,
+        render_mode: Literal["RGB", "D", "ED", "RGB+D", "RGB+ED"] = "RGB",
+        sparse_grad: bool = False,
+        absgrad: bool = False,
+        rasterize_mode: Literal["classic", "antialiased"] = "classic",
+        channel_chunk: int = 32,
+        distributed: bool = False,
+        camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
+        covars: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -253,24 +253,24 @@ def rasterization(
     if sh_degree is None:
         # treat colors as post-activation values, should be in shape [N, D] or [C, N, D]
         assert (colors.dim() == 2 and colors.shape[0] == N) or (
-            colors.dim() == 3 and colors.shape[:2] == (C, N)
+                colors.dim() == 3 and colors.shape[:2] == (C, N)
         ), colors.shape
         if distributed:
             assert (
-                colors.dim() == 2
+                    colors.dim() == 2
             ), "Distributed mode only supports per-Gaussian colors."
     else:
         # treat colors as SH coefficients, should be in shape [N, K, 3] or [C, N, K, 3]
         # Allowing for activating partial SH bands
         assert (
-            colors.dim() == 3 and colors.shape[0] == N and colors.shape[2] == 3
-        ) or (
-            colors.dim() == 4 and colors.shape[:2] == (C, N) and colors.shape[3] == 3
-        ), colors.shape
+                       colors.dim() == 3 and colors.shape[0] == N and colors.shape[2] == 3
+               ) or (
+                       colors.dim() == 4 and colors.shape[:2] == (C, N) and colors.shape[3] == 3
+               ), colors.shape
         assert (sh_degree + 1) ** 2 <= colors.shape[-2], colors.shape
         if distributed:
             assert (
-                colors.dim() == 3
+                    colors.dim() == 3
             ), "Distributed mode only supports per-Gaussian colors."
 
     if absgrad:
@@ -429,7 +429,7 @@ def rasterization(
                 [0] + N_world[:-1],
                 device=gaussian_ids.device,
                 dtype=gaussian_ids.dtype,
-            )
+                )
             offsets = torch.cumsum(offsets, dim=0)
             offsets = offsets.repeat_interleave(torch.stack(cnts))
             gaussian_ids = gaussian_ids + offsets
@@ -577,7 +577,7 @@ def rasterization(
             [
                 render_colors[..., :-1],
                 render_colors[..., -1:] / render_alphas.clamp(min=1e-10),
-            ],
+                ],
             dim=-1,
         )
 
@@ -585,25 +585,25 @@ def rasterization(
 
 
 def _rasterization(
-    means: Tensor,  # [N, 3]
-    quats: Tensor,  # [N, 4]
-    scales: Tensor,  # [N, 3]
-    opacities: Tensor,  # [N]
-    colors: Tensor,  # [(C,) N, D] or [(C,) N, K, 3]
-    viewmats: Tensor,  # [C, 4, 4]
-    Ks: Tensor,  # [C, 3, 3]
-    width: int,
-    height: int,
-    near_plane: float = 0.01,
-    far_plane: float = 1e10,
-    eps2d: float = 0.3,
-    sh_degree: Optional[int] = None,
-    tile_size: int = 16,
-    backgrounds: Optional[Tensor] = None,
-    render_mode: Literal["RGB", "D", "ED", "RGB+D", "RGB+ED"] = "RGB",
-    rasterize_mode: Literal["classic", "antialiased"] = "classic",
-    channel_chunk: int = 32,
-    batch_per_iter: int = 100,
+        means: Tensor,  # [N, 3]
+        quats: Tensor,  # [N, 4]
+        scales: Tensor,  # [N, 3]
+        opacities: Tensor,  # [N]
+        colors: Tensor,  # [(C,) N, D] or [(C,) N, K, 3]
+        viewmats: Tensor,  # [C, 4, 4]
+        Ks: Tensor,  # [C, 3, 3]
+        width: int,
+        height: int,
+        near_plane: float = 0.01,
+        far_plane: float = 1e10,
+        eps2d: float = 0.3,
+        sh_degree: Optional[int] = None,
+        tile_size: int = 16,
+        backgrounds: Optional[Tensor] = None,
+        render_mode: Literal["RGB", "D", "ED", "RGB+D", "RGB+ED"] = "RGB",
+        rasterize_mode: Literal["classic", "antialiased"] = "classic",
+        channel_chunk: int = 32,
+        batch_per_iter: int = 100,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """A version of rasterization() that utilies on PyTorch's autograd.
 
@@ -639,16 +639,16 @@ def _rasterization(
     if sh_degree is None:
         # treat colors as post-activation values, should be in shape [N, D] or [C, N, D]
         assert (colors.dim() == 2 and colors.shape[0] == N) or (
-            colors.dim() == 3 and colors.shape[:2] == (C, N)
+                colors.dim() == 3 and colors.shape[:2] == (C, N)
         ), colors.shape
     else:
         # treat colors as SH coefficients, should be in shape [N, K, 3] or [C, N, K, 3]
         # Allowing for activating partial SH bands
         assert (
-            colors.dim() == 3 and colors.shape[0] == N and colors.shape[2] == 3
-        ) or (
-            colors.dim() == 4 and colors.shape[:2] == (C, N) and colors.shape[3] == 3
-        ), colors.shape
+                       colors.dim() == 3 and colors.shape[0] == N and colors.shape[2] == 3
+               ) or (
+                       colors.dim() == 4 and colors.shape[:2] == (C, N) and colors.shape[3] == 3
+               ), colors.shape
         assert (sh_degree + 1) ** 2 <= colors.shape[-2], colors.shape
 
     # Project Gaussians to 2D.
@@ -776,7 +776,7 @@ def _rasterization(
             [
                 render_colors[..., :-1],
                 render_colors[..., -1:] / render_alphas.clamp(min=1e-10),
-            ],
+                ],
             dim=-1,
         )
 
@@ -893,21 +893,21 @@ def _rasterization(
 
 
 def rasterization_inria_wrapper(
-    means: Tensor,  # [N, 3]
-    quats: Tensor,  # [N, 4]
-    scales: Tensor,  # [N, 3]
-    opacities: Tensor,  # [N]
-    colors: Tensor,  # [N, D] or [N, K, 3]
-    viewmats: Tensor,  # [C, 4, 4]
-    Ks: Tensor,  # [C, 3, 3]
-    width: int,
-    height: int,
-    near_plane: float = 0.01,
-    far_plane: float = 100.0,
-    eps2d: float = 0.3,
-    sh_degree: Optional[int] = None,
-    backgrounds: Optional[Tensor] = None,
-    **kwargs,
+        means: Tensor,  # [N, 3]
+        quats: Tensor,  # [N, 4]
+        scales: Tensor,  # [N, 3]
+        opacities: Tensor,  # [N]
+        colors: Tensor,  # [N, D] or [N, K, 3]
+        viewmats: Tensor,  # [C, 4, 4]
+        Ks: Tensor,  # [C, 3, 3]
+        width: int,
+        height: int,
+        near_plane: float = 0.01,
+        far_plane: float = 100.0,
+        eps2d: float = 0.3,
+        sh_degree: Optional[int] = None,
+        backgrounds: Optional[Tensor] = None,
+        **kwargs,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Wrapper for Inria's rasterization backend.
 
@@ -1004,28 +1004,28 @@ def rasterization_inria_wrapper(
 
 ###### 2DGS ######
 def rasterization_2dgs(
-    means: Tensor,
-    quats: Tensor,
-    scales: Tensor,
-    opacities: Tensor,
-    colors: Tensor,
-    viewmats: Tensor,
-    Ks: Tensor,
-    width: int,
-    height: int,
-    near_plane: float = 0.01,
-    far_plane: float = 1e10,
-    radius_clip: float = 0.0,
-    eps2d: float = 0.3,
-    sh_degree: Optional[int] = None,
-    packed: bool = False,
-    tile_size: int = 16,
-    backgrounds: Optional[Tensor] = None,
-    render_mode: Literal["RGB", "D", "ED", "RGB+D", "RGB+ED"] = "RGB",
-    sparse_grad: bool = False,
-    absgrad: bool = False,
-    distloss: bool = False,
-    depth_mode: Literal["expected", "median"] = "expected",
+        means: Tensor,
+        quats: Tensor,
+        scales: Tensor,
+        opacities: Tensor,
+        colors: Tensor,
+        viewmats: Tensor,
+        Ks: Tensor,
+        width: int,
+        height: int,
+        near_plane: float = 0.01,
+        far_plane: float = 1e10,
+        radius_clip: float = 0.0,
+        eps2d: float = 0.3,
+        sh_degree: Optional[int] = None,
+        packed: bool = False,
+        tile_size: int = 16,
+        backgrounds: Optional[Tensor] = None,
+        render_mode: Literal["RGB", "D", "ED", "RGB+D", "RGB+ED"] = "RGB",
+        sparse_grad: bool = False,
+        absgrad: bool = False,
+        distloss: bool = False,
+        depth_mode: Literal["expected", "median"] = "expected",
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
     """Rasterize a set of 2D Gaussians (N) to a batch of image planes (C).
 
@@ -1149,12 +1149,12 @@ def rasterization_2dgs(
         # treat colors as post-activation values
         # colors should be in shape [N, D] or (C, N, D) (silently support)
         assert (colors.dim() == 2 and colors.shape[0] == N) or (
-            colors.dim() == 3 and colors.shape[:2] == (C, N)
+                colors.dim() == 3 and colors.shape[:2] == (C, N)
         ), colors.shape
     else:
         # treat colors as SH coefficients. Allowing for activating partial SH bands
         assert (
-            colors.dim() == 3 and colors.shape[0] == N and colors.shape[2] == 3
+                colors.dim() == 3 and colors.shape[0] == N and colors.shape[2] == 3
         ), colors.shape
         assert (sh_degree + 1) ** 2 <= colors.shape[1], colors.shape
 
@@ -1214,7 +1214,7 @@ def rasterization_2dgs(
     # TODO: SH also suport N-D.
     # Compute the per-view colors
     if not (
-        colors.dim() == 3 and sh_degree is None
+            colors.dim() == 3 and sh_degree is None
     ):  # silently support [C, N, D] color.
         colors = (
             colors[gaussian_ids] if packed else colors.expand(C, *([-1] * colors.dim()))
@@ -1273,7 +1273,7 @@ def rasterization_2dgs(
             [
                 render_colors[..., :-1],
                 render_colors[..., -1:] / render_alphas.clamp(min=1e-10),
-            ],
+                ],
             dim=-1,
         )
     if render_mode in ["RGB+ED", "RGB+D"]:
@@ -1326,22 +1326,22 @@ def rasterization_2dgs(
 
 
 def rasterization_2dgs_inria_wrapper(
-    means: Tensor,  # [N, 3]
-    quats: Tensor,  # [N, 4]
-    scales: Tensor,  # [N, 3]
-    opacities: Tensor,  # [N]
-    colors: Tensor,  # [N, D] or [N, K, 3]
-    viewmats: Tensor,  # [C, 4, 4]
-    Ks: Tensor,  # [C, 3, 3]
-    width: int,
-    height: int,
-    near_plane: float = 0.01,
-    far_plane: float = 100.0,
-    eps2d: float = 0.3,
-    sh_degree: Optional[int] = None,
-    backgrounds: Optional[Tensor] = None,
-    depth_ratio: int = 0,
-    **kwargs,
+        means: Tensor,  # [N, 3]
+        quats: Tensor,  # [N, 4]
+        scales: Tensor,  # [N, 3]
+        opacities: Tensor,  # [N]
+        colors: Tensor,  # [N, D] or [N, K, 3]
+        viewmats: Tensor,  # [C, 4, 4]
+        Ks: Tensor,  # [C, 3, 3]
+        width: int,
+        height: int,
+        near_plane: float = 0.01,
+        far_plane: float = 100.0,
+        eps2d: float = 0.3,
+        sh_degree: Optional[int] = None,
+        backgrounds: Optional[Tensor] = None,
+        depth_ratio: int = 0,
+        **kwargs,
 ) -> Tuple[Tuple, Dict]:
     """Wrapper for 2DGS's rasterization backend which is based on Inria's backend.
 
@@ -1450,7 +1450,7 @@ def rasterization_2dgs_inria_wrapper(
     # for bounded scene, use median depth, i.e., depth_ratio = 1;
     # for unbounded scene, use expected depth, i.e., depth_ratio = 0, to reduce disk aliasing.
     render_depth = (
-        render_depth_expected * (1 - depth_ratio) + (depth_ratio) * render_depth_median
+            render_depth_expected * (1 - depth_ratio) + (depth_ratio) * render_depth_median
     )
 
     normals_surf = depth_to_normal(render_depth, torch.linalg.inv(viewmats), Ks)

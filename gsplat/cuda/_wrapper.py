@@ -451,6 +451,8 @@ def rasterize_to_pixels(
     masks: Optional[Tensor] = None,  # [C, tile_height, tile_width]
     packed: bool = False,
     absgrad: bool = False,
+    collect_weights: bool = False,
+    weights: Optional[Tensor] = None,  # [nnz]
 ) -> Tuple[Tensor, Tensor]:
     """Rasterizes Gaussians to pixels.
 
@@ -565,6 +567,8 @@ def rasterize_to_pixels(
         isect_offsets.contiguous(),
         flatten_ids.contiguous(),
         absgrad,
+        collect_weights,
+        weights.contiguous() if weights is not None else None,
     )
 
     if padded_channels > 0:
@@ -920,7 +924,11 @@ class _RasterizeToPixels(torch.autograd.Function):
         isect_offsets: Tensor,  # [C, tile_height, tile_width]
         flatten_ids: Tensor,  # [n_isects]
         absgrad: bool,
+        collect_weights: bool = False,
+        weights: Tensor = None,
     ) -> Tuple[Tensor, Tensor]:
+
+        weights = weights if collect_weights else torch.empty(0, device=means2d.device)
         render_colors, render_alphas, last_ids = _make_lazy_cuda_func(
             "rasterize_to_pixels_fwd"
         )(
@@ -935,6 +943,8 @@ class _RasterizeToPixels(torch.autograd.Function):
             tile_size,
             isect_offsets,
             flatten_ids,
+            collect_weights,
+            weights,
         )
 
         ctx.save_for_backward(
@@ -1022,6 +1032,8 @@ class _RasterizeToPixels(torch.autograd.Function):
             v_colors,
             v_opacities,
             v_backgrounds,
+            None,
+            None,
             None,
             None,
             None,
