@@ -609,6 +609,8 @@ class Runner:
         width: int,
         height: int,
         masks: Optional[Tensor] = None,
+        collect_weights: bool = False,
+        weights: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
@@ -652,6 +654,8 @@ class Runner:
             rasterize_mode=rasterize_mode,
             distributed=self.world_size > 1,
             camera_model=self.cfg.camera_model,
+            collect_weights=collect_weights,
+            weights=weights,
             **kwargs,
         )
         if masks is not None:
@@ -965,6 +969,9 @@ class Runner:
                     info=info,
                     packed=cfg.packed,
                 )
+                if step in [100, 24_000]:
+                    importance_mask =  self.importance_score()
+                    self.cfg.strategy.importance_prune(params=self.splats, optimizers=self.optimizers, state=self.strategy_state, mask=importance_mask )
             elif isinstance(self.cfg.strategy, MCMCStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
@@ -1076,6 +1083,40 @@ class Runner:
             for k, v in stats.items():
                 self.writer.add_scalar(f"{stage}/{k}", v, step)
             self.writer.flush()
+
+    @torch.no_grad()
+    def importance_score(self):
+        """Entry for trajectory rendering."""
+        print("Running trajectory rendering...")
+        cfg = self.cfg
+        device = self.device
+
+        camtoworlds_all = self.parser.camtoworlds[5:-5]
+        camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
+        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
+        width, height = list(self.parser.imsize_dict.values())[0]
+
+        weights = torch.zeros_like(self.splats["opacities"])
+        for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
+            camtoworlds = camtoworlds_all[i : i + 1]
+            Ks = K[None]
+
+            renders, _, _ = self.rasterize_splats(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=cfg.sh_degree,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                render_mode="RGB+ED",
+                collect_weights=True,
+                weights=weights,
+            )  # [1, H, W, 4]
+
+        mask = weights < 0.01
+        print(f"Number of low contributing GS: {mask.sum().item()} with total gaussians: {len(weights)}")
+        return mask
 
     @torch.no_grad()
     def run_compression(self, step: int):

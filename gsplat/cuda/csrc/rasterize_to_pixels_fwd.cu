@@ -8,6 +8,23 @@ namespace gsplat {
 
 namespace cg = cooperative_groups;
 
+__device__ float atomicMaxFloat(float* address, float val) {
+    int* address_as_int = reinterpret_cast<int*>(address);  // Treat float as int
+    int old = *address_as_int;                              // Current value as int
+    int assumed;                                            // Temporary value for comparison
+    int new_val_as_int = __float_as_int(val);               // Convert new float to int bits
+
+    do {
+        assumed = old;
+        float assumed_float = __int_as_float(assumed);      // Convert current int to float
+        if (assumed_float >= val) {
+            return assumed_float;                           // No update needed
+        }
+        old = atomicCAS(address_as_int, assumed, new_val_as_int);
+    } while (assumed != old);                              // Retry on conflict
+
+    return __int_as_float(old);                            // Return old value as float
+}
 /****************************************************************************
  * Rasterization to Pixels Forward Pass
  ****************************************************************************/
@@ -33,7 +50,9 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     S *__restrict__ render_colors, // [C, image_height, image_width, COLOR_DIM]
     S *__restrict__ render_alphas, // [C, image_height, image_width, 1]
-    int32_t *__restrict__ last_ids // [C, image_height, image_width]
+    int32_t *__restrict__ last_ids, // [C, image_height, image_width]
+    bool collect_weights,
+    S *__restrict__ weights
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -155,6 +174,9 @@ __global__ void rasterize_to_pixels_fwd_kernel(
 
             int32_t g = id_batch[t];
             const S vis = alpha * T;
+            if (collect_weights) {
+                atomicMaxFloat(&weights[g], vis);
+            }
             const S *c_ptr = colors + g * COLOR_DIM;
             GSPLAT_PRAGMA_UNROLL
             for (uint32_t k = 0; k < COLOR_DIM; ++k) {
@@ -199,7 +221,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
     const uint32_t tile_size,
     // intersections
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
-    const torch::Tensor &flatten_ids   // [n_isects]
+    const torch::Tensor &flatten_ids,   // [n_isects]
+    bool collect_weights,
+    torch::Tensor &weights
 ) {
     GSPLAT_DEVICE_GUARD(means2d);
     GSPLAT_CHECK_INPUT(means2d);
@@ -213,6 +237,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
     }
     if (masks.has_value()) {
         GSPLAT_CHECK_INPUT(masks.value());
+    }
+    if (collect_weights) {
+        GSPLAT_CHECK_INPUT(weights);
     }
     bool packed = means2d.dim() == 2;
 
@@ -259,6 +286,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
             " bytes), try lowering tile_size."
         );
     }
+
     rasterize_to_pixels_fwd_kernel<CDIM, float>
         <<<blocks, threads, shared_mem, stream>>>(
             C,
@@ -281,7 +309,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
             flatten_ids.data_ptr<int32_t>(),
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
-            last_ids.data_ptr<int32_t>()
+            last_ids.data_ptr<int32_t>(),
+            collect_weights,
+            collect_weights ? weights.data_ptr<float>() : nullptr
         );
 
     return std::make_tuple(renders, alphas, last_ids);
@@ -302,7 +332,9 @@ rasterize_to_pixels_fwd_tensor(
     const uint32_t tile_size,
     // intersections
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
-    const torch::Tensor &flatten_ids   // [n_isects]
+    const torch::Tensor &flatten_ids,   // [n_isects]
+    bool collect_weights,
+    torch::Tensor &weights
 ) {
     GSPLAT_CHECK_INPUT(colors);
     uint32_t channels = colors.size(-1);
@@ -320,7 +352,9 @@ rasterize_to_pixels_fwd_tensor(
             image_height,                                                      \
             tile_size,                                                         \
             tile_offsets,                                                      \
-            flatten_ids                                                        \
+            flatten_ids,                                                       \
+            collect_weights,                                                   \
+            weights                                                            \
         );
 
     // TODO: an optimization can be done by passing the actual number of
