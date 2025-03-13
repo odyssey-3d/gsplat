@@ -56,7 +56,7 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "/home/paja/new_data/xplor/beach_structure/undistort/"
+    data_dir: str = "/home/paja/data/alex_new"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
@@ -725,6 +725,7 @@ class Runner:
                 self.viewer.lock.acquire()
                 tic = time.time()
 
+            self.trainset.update_iteration(step)
             try:
                 data = next(trainloader_iter)
             except StopIteration:
