@@ -68,7 +68,7 @@ class Config:
     # A global scaler that applies to the scene size related parameters
     global_scale: float = 1.0
     # Normalize the world space
-    normalize_world_space: bool = True
+    normalize_world_space: bool = False
     # Camera model
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
 
@@ -614,8 +614,6 @@ class Runner:
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
-        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
-        # rasterization does normalization internally
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
