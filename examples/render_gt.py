@@ -8,17 +8,16 @@ import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from fused_ssim import fused_ssim
 from typing import Optional
+from tqdm import tqdm  # for the progress bar
 
 # ----------------------------------------------------------------
-# Adjust the following imports to match your environment:
+# Adjust these imports to match your environment:
 from datasets.colmap import Parser, Dataset
 from gsplat.rendering import rasterization
 
 # TorchMetrics
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchmetrics.image import PeakSignalNoiseRatio
-
-
 # ----------------------------------------------------------------
 
 @dataclass
@@ -30,7 +29,6 @@ class GaussianData:
     scaling: torch.Tensor  # (N, 3)
     rotation: torch.Tensor  # (N, 4) quaternions
     opacity: torch.Tensor  # (N,)
-
 
 def load_ply(filepath: str) -> GaussianData:
     """
@@ -88,8 +86,8 @@ def load_ply(filepath: str) -> GaussianData:
             features_rest = torch.stack(
                 (
                     shN_tensor[:, :M],
-                    shN_tensor[:, M: 2 * M],
-                    shN_tensor[:, 2 * M: 3 * M],
+                    shN_tensor[:, M : 2 * M],
+                    shN_tensor[:, 2 * M : 3 * M],
                 ),
                 dim=2,
             )
@@ -117,7 +115,6 @@ def load_ply(filepath: str) -> GaussianData:
         rotation=rotation,
         opacity=opacity,
     )
-
 
 def plot_metric_separately(name, values, out_dir):
     """
@@ -172,7 +169,6 @@ def plot_metric_separately(name, values, out_dir):
     plt.savefig(os.path.join(out_dir, f"{name.lower()}_analysis.png"))
     plt.close()
 
-
 def main():
     parser = argparse.ArgumentParser(
         description="Render (via Gaussians) and compare with GT images. Save only the side-by-side comparisons."
@@ -207,7 +203,7 @@ def main():
         data_dir=args.colmap_dir,
         factor=args.factor,
         normalize=True,  # Must match your training usage
-        test_every=-1,  # Put all images into "train" for demonstration
+        test_every=-1,   # put all images into "train" for demonstration
     )
     trainset = Dataset(colmap_parser, split="train")
 
@@ -237,11 +233,11 @@ def main():
     lpips_vals = []
 
     # 3) Render each training image, compute metrics, and save side-by-side
-    for i in range(len(trainset)):
+    for i in tqdm(range(len(trainset)), desc="Rendering & Saving Comparisons"):
         example = trainset[i]
 
         camtoworld = example["camtoworld"].to(device)  # [4,4]
-        K = example["K"].to(device)  # [3,3]
+        K = example["K"].to(device)                    # [3,3]
 
         gt_img = example["image"]  # shape [H, W, 3] or [3, H, W]
         # Ensure GT is float in [0..1]
@@ -299,9 +295,13 @@ def main():
                 f"Render range: [{rendered_torch.min()}, {rendered_torch.max()}]"
             )
 
-        # Compute metrics
+        # Compute metrics as scalars (floats)
         psnr_val = psnr_metric(rendered_torch, gt_torch).item()
-        ssim_val = fused_ssim(rendered_torch, gt_torch)
+        ssim_val_tensor = fused_ssim(rendered_torch, gt_torch)
+        if isinstance(ssim_val_tensor, torch.Tensor):
+            ssim_val = ssim_val_tensor.item()
+        else:
+            ssim_val = float(ssim_val_tensor)
         lpips_val = lpips_metric(rendered_torch, gt_torch).item()
 
         psnr_vals.append(psnr_val)
@@ -321,8 +321,6 @@ def main():
         compare_img = np.concatenate((gt_img_np_255, render_img_np_255), axis=1)
         compare_path = os.path.join(args.out_dir, f"compare_{i:04d}.png")
         imageio.imwrite(compare_path, compare_img)
-
-        print(f"[{i:04d}] PSNR={psnr_val:.3f}, SSIM={ssim_val:.3f}, LPIPS={lpips_val:.3f} -> {compare_path}")
 
     # ------------------------------------------------------------
     # 4) Plot combined metrics evolution (PSNR, SSIM, LPIPS)
@@ -351,8 +349,7 @@ def main():
     plot_metric_separately("SSIM", ssim_array, args.out_dir)
     plot_metric_separately("LPIPS", lpips_array, args.out_dir)
 
-    print("Done! Only compare images are saved. PSNR, SSIM, LPIPS plots + stats are also saved.")
-
+    print("Done!")
 
 if __name__ == "__main__":
     main()
