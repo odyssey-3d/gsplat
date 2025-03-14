@@ -202,7 +202,7 @@ def main():
     colmap_parser = Parser(
         data_dir=args.colmap_dir,
         factor=args.factor,
-        normalize=True,  # Must match your training usage
+        normalize=False,  # Must match your training usage
         test_every=-1,   # put all images into "train" for demonstration
     )
     trainset = Dataset(colmap_parser, split="train")
