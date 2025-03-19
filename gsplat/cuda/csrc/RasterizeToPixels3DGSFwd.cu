@@ -33,10 +33,10 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     const uint32_t tile_height,
     const int32_t *__restrict__ tile_offsets, // [C, tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
-    scalar_t
-        *__restrict__ render_colors, // [C, image_height, image_width, CDIM]
+    scalar_t *__restrict__ render_colors, // [C, image_height, image_width, CDIM]
     scalar_t *__restrict__ render_alphas, // [C, image_height, image_width, 1]
-    int32_t *__restrict__ last_ids        // [C, image_height, image_width]
+    int32_t *__restrict__ last_ids,        // [C, image_height, image_width]
+    int32_t *__restrict__ pixels
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -157,6 +157,8 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
             }
 
             int32_t g = id_batch[t];
+            // Pixel-GS counting
+            atomicAdd(&pixels[g], 1);
             const float vis = alpha * T;
             const float *c_ptr = colors + g * CDIM;
 #pragma unroll
@@ -206,7 +208,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     // outputs
     at::Tensor renders, // [C, image_height, image_width, channels]
     at::Tensor alphas,  // [C, image_height, image_width]
-    at::Tensor last_ids // [C, image_height, image_width]
+    at::Tensor last_ids, // [C, image_height, image_width]
+    at::Tensor pixels // [C, N]
 ) {
     bool packed = means2d.dim() == 2;
 
@@ -261,7 +264,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
             flatten_ids.data_ptr<int32_t>(),
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
-            last_ids.data_ptr<int32_t>()
+            last_ids.data_ptr<int32_t>(),
+            pixels.data_ptr<int32_t>()
         );
 }
 
@@ -283,7 +287,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         const at::Tensor flatten_ids,                                          \
         at::Tensor renders,                                                    \
         at::Tensor alphas,                                                     \
-        at::Tensor last_ids                                                    \
+        at::Tensor last_ids,                                                   \
+        at::Tensor pixels                                                      \
     );
 
 __INS__(1)
