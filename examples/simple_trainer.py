@@ -474,7 +474,7 @@ class Runner:
             load_depths=cfg.depth_loss,
         )
         self.valset = Dataset(self.parser, split="val")
-        self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
+        self.scene_scale = self.parser.scene_scale * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
         # Model
