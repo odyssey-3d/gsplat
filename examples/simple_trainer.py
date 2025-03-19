@@ -728,6 +728,7 @@ class Runner:
                 self.viewer.lock.acquire()
                 tic = time.time()
 
+            self.trainset.update_iteration(step)
             try:
                 data = next(trainloader_iter)
             except StopIteration:
