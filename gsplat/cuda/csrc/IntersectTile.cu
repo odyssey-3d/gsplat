@@ -20,6 +20,65 @@ namespace cg = cooperative_groups;
 // Sloan, JCGT 2013 See https://jcgt.org/published/0002/02/06/ for reference
 // implementation
 
+__forceinline__ __device__ float fast_sqrt_f32(float x) {
+    float y;
+    asm volatile("sqrt.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+__forceinline__ __device__ bool segment_intersect_ellipse(float a, float b, float c, float d, float l, float r) {
+    float delta = b * b - 4.0f * a * c;
+    float t1 = (l - d) * (2.0f * a) + b;
+    float t2 = (r - d) * (2.0f * a) + b;
+    return delta >= 0.0f && (t1 <= 0.0f || t1 * t1 <= delta) && (t2 >= 0.0f || t2 * t2 <= delta);
+}
+
+__forceinline__ __device__ bool block_intersect_ellipse(int2 pix_min, int2 pix_max, float2 center, float3 conic, float power) {
+    float a, b, c, dx, dy;
+    float w = 2.0f * power;
+
+    if (center.x * 2.0f < pix_min.x + pix_max.x) {
+        dx = center.x - pix_min.x;
+    } else {
+        dx = center.x - pix_max.x;
+    }
+    a = conic.z;
+    b = -2.0f * conic.y * dx;
+    c = conic.x * dx * dx - w;
+
+    if (segment_intersect_ellipse(a, b, c, center.y, pix_min.y, pix_max.y)) {
+        return true;
+    }
+
+    if (center.y * 2.0f < pix_min.y + pix_max.y) {
+        dy = center.y - pix_min.y;
+    } else {
+        dy = center.y - pix_max.y;
+    }
+    a = conic.x;
+    b = -2.0f * conic.y * dy;
+    c = conic.z * dy * dy - w;
+
+    return segment_intersect_ellipse(a, b, c, center.x, pix_min.x, pix_max.x);
+}
+
+__forceinline__ __device__ bool block_contains_center(int2 pix_min, int2 pix_max, float2 center) {
+    return center.x >= pix_min.x && center.x <= pix_max.x &&
+           center.y >= pix_min.y && center.y <= pix_max.y;
+}
+
+__forceinline__ __device__ void getRect(const float2 p, float radius, int width, int height,
+                                      int2& rect_min, int2& rect_max) {
+    rect_min = {
+        min(width, max(0, (int)(p.x - radius))),
+        min(height, max(0, (int)(p.y - radius)))
+    };
+    rect_max = {
+        min(width, max(0, (int)(p.x + radius) + 1)),
+        min(height, max(0, (int)(p.y + radius) + 1))
+    };
+}
+
 template <typename scalar_t>
 __global__ void intersect_tile_kernel(
     // if the data is [C, N, ...] or [nnz, ...] (packed)
@@ -34,6 +93,8 @@ __global__ void intersect_tile_kernel(
     // data
     const scalar_t *__restrict__ means2d,            // [C, N, 2] or [nnz, 2]
     const int32_t *__restrict__ radii,               // [C, N] or [nnz]
+    const scalar_t *__restrict__ conics,             // [C, N, 3] or [nnz, 3]
+    const scalar_t *__restrict__ opacities,          // [C, N] or [nnz]
     const scalar_t *__restrict__ depths,             // [C, N] or [nnz]
     const int64_t *__restrict__ cum_tiles_per_gauss, // [C, N] or [nnz]
     const uint32_t tile_size,
@@ -46,13 +107,25 @@ __global__ void intersect_tile_kernel(
 ) {
     // parallelize over C * N.
     uint32_t idx = cg::this_grid().thread_rank();
-    bool first_pass = cum_tiles_per_gauss == nullptr;
     if (idx >= (packed ? nnz : C * N)) {
         return;
     }
 
-    const float radius = radii[idx];
-    if (radius <= 0) {
+    // Early culling
+    const bool first_pass = cum_tiles_per_gauss == nullptr;
+    scalar_t depth = depths[idx];
+    if (depth <= 0.2f) {
+        if (first_pass) tiles_per_gauss[idx] = 0;
+        return;
+    }
+
+    if (opacities[idx] <= 1.0f / 255.f) {
+        if (first_pass) tiles_per_gauss[idx] = 0;
+        return;
+    }
+
+    const scalar_t radius = radii[idx];
+    if (radius <= 0.f) {
         if (first_pass) {
             tiles_per_gauss[idx] = 0;
         }
@@ -61,50 +134,79 @@ __global__ void intersect_tile_kernel(
 
     vec2 mean2d = glm::make_vec2(means2d + 2 * idx);
 
-    float tile_radius = radius / static_cast<float>(tile_size);
-    float tile_x = mean2d.x / static_cast<float>(tile_size);
-    float tile_y = mean2d.y / static_cast<float>(tile_size);
+    // Convert to tile space and compute conic
+    float2 center = {static_cast<scalar_t>(mean2d.x / static_cast<scalar_t>(tile_size)),
+                    static_cast<scalar_t>(mean2d.y / static_cast<scalar_t>(tile_size))};
+    scalar_t tile_radius = static_cast<scalar_t>(radius / static_cast<scalar_t>(tile_size));
 
-    // tile_min is inclusive, tile_max is exclusive
-    uint2 tile_min, tile_max;
-    tile_min.x = min(max(0, (uint32_t)floor(tile_x - tile_radius)), tile_width);
-    tile_min.y =
-        min(max(0, (uint32_t)floor(tile_y - tile_radius)), tile_height);
-    tile_max.x = min(max(0, (uint32_t)ceil(tile_x + tile_radius)), tile_width);
-    tile_max.y = min(max(0, (uint32_t)ceil(tile_y + tile_radius)), tile_height);
+    // Compute conic parameters
+    const float3 conic = {conics[3 * idx], conics[3 * idx + 1], conics[3 * idx + 2]};
+    float power = 4.0f; // Power tuning parameter
 
-    if (first_pass) {
-        // first pass only writes out tiles_per_gauss
-        tiles_per_gauss[idx] = static_cast<int32_t>(
-            (tile_max.y - tile_min.y) * (tile_max.x - tile_min.x)
-        );
+    // Get tile bounds
+    int2 tile_min, tile_max;
+    getRect(center, tile_radius, tile_width, tile_height, tile_min, tile_max);
+
+    // Single tile optimization
+    const bool single_tile = (tile_max.x - tile_min.x) * (tile_max.y - tile_min.y) == 1;
+    const int64_t depth_id = __float_as_int(static_cast<float>(depth));
+    if (single_tile) {
+        int2 pix_min = {tile_min.x * (int)tile_size, tile_min.y * (int)tile_size};
+        int2 pix_max = {pix_min.x + (int)tile_size - 1, pix_min.y + (int)tile_size - 1};
+
+        float2 mean2d_float = {static_cast<float>(mean2d.x), static_cast<float>(mean2d.y)};
+        if (block_contains_center(pix_min, pix_max, mean2d_float) ||
+            block_intersect_ellipse(pix_min, pix_max, mean2d_float, conic, power)) {
+
+            if (first_pass) {
+                tiles_per_gauss[idx] = 1;
+            } else {
+                int64_t cid = packed ? camera_ids[idx] : idx / N;
+                int64_t tile_id = tile_min.y * tile_width + tile_min.x;
+
+                int64_t key = (cid << (32 + tile_n_bits)) | (tile_id << 32) | depth_id;
+                int64_t offset = (idx == 0) ? 0 : cum_tiles_per_gauss[idx - 1];
+
+                isect_ids[offset] = key;
+                flatten_ids[offset] = idx;
+            }
+        } else if (first_pass) {
+            tiles_per_gauss[idx] = 0;
+        }
         return;
     }
 
-    int64_t cid; // camera id
-    if (packed) {
-        // parallelize over nnz
-        cid = camera_ids[idx];
-        // gid = gaussian_ids[idx];
-    } else {
-        // parallelize over C * N
-        cid = idx / N;
-        // gid = idx % N;
-    }
-    const int64_t cid_enc = cid << (32 + tile_n_bits);
-
-    int64_t depth_id_enc = (int64_t) * (int32_t *)&(depths[idx]);
-    int64_t cur_idx = (idx == 0) ? 0 : cum_tiles_per_gauss[idx - 1];
+    // Multi-tile processing
+    int32_t tile_count = 0;
     for (int32_t i = tile_min.y; i < tile_max.y; ++i) {
         for (int32_t j = tile_min.x; j < tile_max.x; ++j) {
-            int64_t tile_id = i * tile_width + j;
-            // e.g. tile_n_bits = 22:
-            // camera id (10 bits) | tile id (22 bits) | depth (32 bits)
-            isect_ids[cur_idx] = cid_enc | (tile_id << 32) | depth_id_enc;
-            // the flatten index in [C * N] or [nnz]
-            flatten_ids[cur_idx] = static_cast<int32_t>(idx);
-            ++cur_idx;
+            int2 pix_min = {j * (int)tile_size, i * (int)tile_size};
+            int2 pix_max = {pix_min.x + (int)tile_size - 1, pix_min.y + (int)tile_size - 1};
+
+            float2 mean2d_float = {static_cast<float>(mean2d.x), static_cast<float>(mean2d.y)};
+            if (block_contains_center(pix_min, pix_max, mean2d_float) ||
+                block_intersect_ellipse(pix_min, pix_max, mean2d_float, conic, power)) {
+
+                if (first_pass) {
+                    tile_count++;
+                } else {
+                    int64_t cid = packed ? camera_ids[idx] : idx / N;
+                    int64_t tile_id = i * tile_width + j;
+
+                    int64_t key = (cid << (32 + tile_n_bits)) | (tile_id << 32) | depth_id;
+                    int64_t offset = (idx == 0) ? 0 : cum_tiles_per_gauss[idx - 1];
+                    offset += tile_count;
+
+                    isect_ids[offset] = key;
+                    flatten_ids[offset] = idx;
+                    tile_count++;
+                }
+            }
         }
+    }
+
+    if (first_pass) {
+        tiles_per_gauss[idx] = tile_count;
     }
 }
 
@@ -112,6 +214,8 @@ void launch_intersect_tile_kernel(
     // inputs
     const at::Tensor means2d,                    // [C, N, 2] or [nnz, 2]
     const at::Tensor radii,                      // [C, N] or [nnz]
+    const at::Tensor conics,                    // [C, N, 3] or [nnz, 3]
+    const at::Tensor opacities,                 // [C, N] or [nnz]
     const at::Tensor depths,                     // [C, N] or [nnz]
     const at::optional<at::Tensor> camera_ids,   // [nnz]
     const at::optional<at::Tensor> gaussian_ids, // [nnz]
@@ -178,6 +282,8 @@ void launch_intersect_tile_kernel(
                         : nullptr,
                     means2d.data_ptr<scalar_t>(),
                     radii.data_ptr<int32_t>(),
+                    conics.data_ptr<scalar_t>(),
+                    opacities.data_ptr<scalar_t>(),
                     depths.data_ptr<scalar_t>(),
                     cum_tiles_per_gauss.has_value()
                         ? cum_tiles_per_gauss.value().data_ptr<int64_t>()

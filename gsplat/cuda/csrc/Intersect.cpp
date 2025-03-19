@@ -15,6 +15,8 @@ namespace gsplat {
 std::tuple<at::Tensor, at::Tensor, at::Tensor> intersect_tile(
     const at::Tensor means2d,                    // [C, N, 2] or [nnz, 2]
     const at::Tensor radii,                      // [C, N] or [nnz]
+    const at::Tensor &conics,                 // [C, N, 3] or [nnz, 3]
+    const at::Tensor &opacities,              // [C, N] or [nnz]
     const at::Tensor depths,                     // [C, N] or [nnz]
     const at::optional<at::Tensor> camera_ids,   // [nnz]
     const at::optional<at::Tensor> gaussian_ids, // [nnz]
@@ -26,7 +28,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> intersect_tile(
 ) {
     DEVICE_GUARD(means2d);
     CHECK_INPUT(means2d);
+    CHECK_INPUT(opacities);
     CHECK_INPUT(radii);
+    CHECK_INPUT(conics);
     CHECK_INPUT(depths);
 
     uint32_t n_elements = means2d.numel() / 2;
@@ -61,6 +65,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> intersect_tile(
             // inputs
             means2d,
             radii,
+            conics,
+            opacities,
             depths,
             packed ? camera_ids : c10::nullopt,
             packed ? gaussian_ids : c10::nullopt,
@@ -90,6 +96,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> intersect_tile(
             // inputs
             means2d,
             radii,
+            conics,
+            opacities,
             depths,
             packed ? camera_ids : c10::nullopt,
             packed ? gaussian_ids : c10::nullopt,
