@@ -657,6 +657,9 @@ class Runner:
             )
         except Exception as e:
             print(e)
+            print(traceback.format_exc())
+            raise
+
         if masks is not None:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info

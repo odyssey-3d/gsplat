@@ -44,16 +44,9 @@ class DefaultStrategy(Strategy):
     absgrad: bool = False
     revised_opacity: bool = True
     verbose: bool = False
-    binoms: torch.Tensor = None
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
-        n_max = 51
-        binoms = torch.zeros((n_max, n_max))
-        for n in range(n_max):
-            for k in range(n + 1):
-                binoms[n, k] = math.comb(n, k)
-        self.binoms = binoms
         return {"grad2d": None, "count": None, "scene_scale": scene_scale, "radii": None}
 
     def check_sanity(
@@ -86,7 +79,6 @@ class DefaultStrategy(Strategy):
         info: Dict[str, Any],
         packed: bool = False,
     ):
-        self.binoms = self.binoms.to(params["means"].device)
         self._update_state(params, state, info, packed=packed)
 
         # ----------------------------------------------------------------------------
@@ -133,7 +125,7 @@ class DefaultStrategy(Strategy):
         info: Dict[str, Any],
         packed: bool = False,
     ):
-        for key in ["width", "height", "n_cameras", "radii", "gaussian_ids", self.key_for_gradient]:
+        for key in ["width", "height", "n_cameras", "pixels", "radii", "gaussian_ids", self.key_for_gradient]:
             assert key in info, f"{key} is required but missing."
 
         if self.absgrad:
@@ -156,15 +148,17 @@ class DefaultStrategy(Strategy):
         if packed:
             gs_ids = info["gaussian_ids"]
             radii = info["radii"]
+            pixels = torch.ones_like(radii)
         else:
             sel = info["radii"] > 0.0
             gs_ids = torch.where(sel)[1]
             grads = grads[sel]
             radii = info["radii"][sel]
+            pixels = info["pixels"][sel]
 
         norms = grads.norm(dim=-1)
-        state["grad2d"].index_add_(0, gs_ids, norms)
-        state["count"].index_add_(0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32))
+        state["grad2d"].index_add_(0, gs_ids, norms * pixels)
+        state["count"].index_add_(0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32) * pixels)
 
         # keep the max radii for each splat
         max_wh = float(max(w, h))

@@ -56,7 +56,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3
     at::Tensor last_ids = at::empty(
         {C, image_height, image_width}, means2d.options().dtype(at::kInt)
     );
-    at::Tensor pixels = at::empty(
+    at::Tensor pixels = at::zeros(
         {C, means2d.size(1)}, means2d.options().dtype(at::kInt)
     );
 
