@@ -20,6 +20,9 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchmetrics.image import PeakSignalNoiseRatio
 # ----------------------------------------------------------------
 
+# For computing bootstrap confidence intervals:
+from scipy.stats import bootstrap
+
 @dataclass
 class GaussianData:
     active_sh_degree: int
@@ -116,14 +119,29 @@ def load_ply(filepath: str) -> GaussianData:
         opacity=opacity,
     )
 
+
+def compute_median_confidence_interval(data, confidence=0.95, n_resamples=10000):
+    """
+    Computes the 2-sided confidence interval for the median using a bootstrap method.
+    Returns (ci_low, ci_high).
+    """
+    data = np.array(data, dtype=float)  # ensure float
+    # SciPy's bootstrap for the median (BCa method for better accuracy):
+    # This requires scipy >= 1.7.0, or specifically >= 1.10 for 'BCa' method.
+    res = bootstrap((data,), np.median, confidence_level=confidence,
+                    n_resamples=n_resamples, method='BCa', random_state=123)
+    return res.confidence_interval.low, res.confidence_interval.high
+
+
 def plot_metric_separately(name, values, out_dir):
     """
     Plots the given metric in two subplots:
-      1) A line plot over image index (with statistics).
+      1) A line plot over image index (with statistics + 95% CI for the median).
       2) A histogram of values.
 
-    - Draws a mean line on the top subplot.
+    - Draws a median line on the top subplot.
     - Shows stats (mean, median, std, var, min, max).
+    - Adds a shaded region for the 95% confidence interval of the median.
     """
     mean_val = values.mean()
     median_val = np.median(values)
@@ -132,28 +150,35 @@ def plot_metric_separately(name, values, out_dir):
     min_val = values.min()
     max_val = values.max()
 
+    # Compute 95% CI for the median
+    ci_low, ci_high = compute_median_confidence_interval(values, confidence=0.95)
+
     indices = np.arange(len(values))
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
 
-    # Plot main metric vs index
-    ax1.plot(indices, values, marker='o', label=name)
-    # Draw horizontal mean line
-    ax1.axhline(y=mean_val, label="Mean")
+    # Plot metric vs. index
+    ax1.plot(indices, values, marker='o', label=name, color='blue', alpha=0.7)
+    # Draw horizontal median line
+    ax1.axhline(y=median_val, color='red', linestyle='--', label="Median")
+
+    # Add a horizontal band for the 95% CI of the median
+    ax1.axhspan(ci_low, ci_high, color='orange', alpha=0.2, label="95% CI (Median)")
 
     ax1.set_title(f"{name} vs. Image Index")
     ax1.set_xlabel("Image Index")
     ax1.set_ylabel(name)
-    ax1.legend()
+    ax1.legend(loc="best")
 
     # Build a string for stats
     stats_str = "\n".join([
-        f"Mean:   {mean_val:.4f}",
-        f"Median: {median_val:.4f}",
-        f"Std:    {std_val:.4f}",
-        f"Var:    {var_val:.4f}",
-        f"Min:    {min_val:.4f}",
-        f"Max:    {max_val:.4f}",
+        f"Median:  {median_val:.4f}",
+        f"Mean:    {mean_val:.4f}",
+        f"Std:     {std_val:.4f}",
+        f"Var:     {var_val:.4f}",
+        f"Min:     {min_val:.4f}",
+        f"Max:     {max_val:.4f}",
+        f"95% CI (Median): [{ci_low:.4f}, {ci_high:.4f}]"
     ])
     # Place stats in the top-left corner of the upper subplot
     ax1.text(
@@ -167,7 +192,7 @@ def plot_metric_separately(name, values, out_dir):
     )
 
     # Histogram
-    ax2.hist(values, bins=20, alpha=0.7)
+    ax2.hist(values, bins=20, alpha=0.7, color='blue', edgecolor='black')
     ax2.set_title(f"{name} Distribution")
     ax2.set_xlabel(f"{name} Value")
     ax2.set_ylabel("Frequency")
@@ -176,33 +201,51 @@ def plot_metric_separately(name, values, out_dir):
     plt.savefig(os.path.join(out_dir, f"{name.lower()}_analysis.png"))
     plt.close()
 
-def find_stable_runs(psnr, ssim, lpips, psnr_thresh=0.1, ssim_thresh=0.01, lpips_thresh=0.01):
+
+def find_long_strikes(psnr_array, ssim_array, lpips_array,
+                      psnr_med_low, ssim_med_low, lpips_med_high):
     """
-    Find the runs (start_index, end_index) of consecutive frames where
-    the absolute changes in each metric between consecutive frames do not
-    exceed the given thresholds. Each run is inclusive of start and end indices.
+    A "long strike" is defined as a consecutive set of frames for which:
+      - PSNR >= psnr_med_low  (because higher is better than or at median lower bound)
+      - SSIM >= ssim_med_low
+      - LPIPS <= lpips_med_high (lower is better, so we check if it's below median upper bound)
+
+    We gather all consecutive frames that meet these criteria, then
+    return them sorted by descending length (end_index - start_index + 1).
     """
-    stable_runs = []
-    if len(psnr) == 0:
-        return stable_runs
 
-    start_idx = 0
-    for i in range(len(psnr) - 1):
-        # Check changes for the three metrics from frame i to i+1
-        if (abs(psnr[i+1] - psnr[i]) > psnr_thresh or
-            abs(ssim[i+1] - ssim[i]) > ssim_thresh or
-            abs(lpips[i+1] - lpips[i]) > lpips_thresh):
-            # We have exceeded the threshold => end the current stable run
-            stable_runs.append((start_idx, i))
-            start_idx = i + 1
+    n = len(psnr_array)
+    if n == 0:
+        return []
 
-    # Don't forget the final run
-    stable_runs.append((start_idx, len(psnr) - 1))
+    # Build a boolean mask "good_mask": True if frame meets the conditions, False otherwise.
+    good_mask = (
+        (psnr_array >= psnr_med_low) &
+        (ssim_array >= ssim_med_low) &
+        (lpips_array <= lpips_med_high)
+    )
 
-    # Sort runs by descending length
-    stable_runs.sort(key=lambda r: (r[1] - r[0] + 1), reverse=True)
+    strikes = []
+    strike_start = None
+    for i in range(n):
+        if good_mask[i]:
+            # Start of a strike (or continuation) if not already started
+            if strike_start is None:
+                strike_start = i
+        else:
+            # End of a strike if we had started one
+            if strike_start is not None:
+                strikes.append((strike_start, i - 1))
+                strike_start = None
 
-    return stable_runs
+    # If still in a strike at the end:
+    if strike_start is not None:
+        strikes.append((strike_start, n - 1))
+
+    # Sort by length descending
+    strikes.sort(key=lambda x: (x[1] - x[0] + 1), reverse=True)
+    return strikes
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -343,7 +386,7 @@ def main():
         ssim_vals.append(ssim_val)
         lpips_vals.append(lpips_val)
 
-        # Create side-by-side (compare) image: [H, W*2, 3] in [0..255]
+        # Create side-by-side comparison image: [H, W*2, 3] in [0..255]
         render_img_np = render_img_cpu.numpy()  # [H, W, 3], float [0..1]
         render_img_np_255 = (render_img_np * 255).astype(np.uint8)
 
@@ -358,39 +401,57 @@ def main():
         imageio.imwrite(compare_path, compare_img)
 
     # ------------------------------------------------------------
-    # 4) Plot combined metrics evolution (PSNR, SSIM, LPIPS)
+    # 4) Plot combined metrics evolution (PSNR, SSIM, LPIPS) with median + 95% CI
     # ------------------------------------------------------------
     indices = np.arange(len(trainset))
     psnr_array = np.array(psnr_vals)
     ssim_array = np.array(ssim_vals)
     lpips_array = np.array(lpips_vals)
 
-    # Compute stats for each metric
-    psnr_mean, psnr_median = psnr_array.mean(), np.median(psnr_array)
-    psnr_std, psnr_var = psnr_array.std(), psnr_array.var()
+    # Median-based stats
+    psnr_median = np.median(psnr_array)
+    ssim_median = np.median(ssim_array)
+    lpips_median = np.median(lpips_array)
 
-    ssim_mean, ssim_median = ssim_array.mean(), np.median(ssim_array)
-    ssim_std, ssim_var = ssim_array.std(), ssim_array.var()
+    # 95% CIs (median)
+    psnr_med_low, psnr_med_high = compute_median_confidence_interval(psnr_array)
+    ssim_med_low, ssim_med_high = compute_median_confidence_interval(ssim_array)
+    lpips_med_low, lpips_med_high = compute_median_confidence_interval(lpips_array)
 
-    lpips_mean, lpips_median = lpips_array.mean(), np.median(lpips_array)
-    lpips_std, lpips_var = lpips_array.std(), lpips_array.var()
+    # We'll still compute mean/std for reference if desired
+    psnr_mean = psnr_array.mean()
+    psnr_std = psnr_array.std()
+    ssim_mean = ssim_array.mean()
+    ssim_std = ssim_array.std()
+    lpips_mean = lpips_array.mean()
+    lpips_std = lpips_array.std()
 
     plt.figure(figsize=(10, 6))
-    plt.plot(indices, psnr_array, label="PSNR")
-    plt.plot(indices, ssim_array, label="SSIM")
-    plt.plot(indices, lpips_array, label="LPIPS")
-    plt.xlabel("Image Index")
-    plt.ylabel("Metric Value")
-    plt.title("Metrics Evolution over Training Images")
-    plt.legend()
-
-    # Add a text box with summary stats
-    text_stats = (
-        f"PSNR: mean={psnr_mean:.4f}, median={psnr_median:.4f}, std={psnr_std:.4f}, var={psnr_var:.4f}\n"
-        f"SSIM: mean={ssim_mean:.4f}, median={ssim_median:.4f}, std={ssim_std:.4f}, var={ssim_var:.4f}\n"
-        f"LPIPS: mean={lpips_mean:.4f}, median={lpips_median:.4f}, std={lpips_std:.4f}, var={lpips_var:.4f}"
-    )
     ax = plt.gca()
+
+    # Plot each metric's values
+    ax.plot(indices, psnr_array, label="PSNR", color='blue')
+    ax.axhline(y=psnr_median, color='blue', linestyle='--', label="PSNR Median")
+    ax.axhspan(psnr_med_low, psnr_med_high, color='blue', alpha=0.05, label="PSNR 95% CI (Median)")
+
+    ax.plot(indices, ssim_array, label="SSIM", color='green')
+    ax.axhline(y=ssim_median, color='green', linestyle='--', label="SSIM Median")
+    ax.axhspan(ssim_med_low, ssim_med_high, color='green', alpha=0.05, label="SSIM 95% CI (Median)")
+
+    ax.plot(indices, lpips_array, label="LPIPS", color='red')
+    ax.axhline(y=lpips_median, color='red', linestyle='--', label="LPIPS Median")
+    ax.axhspan(lpips_med_low, lpips_med_high, color='red', alpha=0.05, label="LPIPS 95% CI (Median)")
+
+    ax.set_xlabel("Image Index")
+    ax.set_ylabel("Metric Value")
+    ax.set_title("Metrics Evolution (Median + 95% CI)")
+    ax.legend(loc="best")
+
+    text_stats = (
+        f"PSNR: median={psnr_median:.4f}, CI=[{psnr_med_low:.4f}, {psnr_med_high:.4f}], mean={psnr_mean:.4f}, std={psnr_std:.4f}\n"
+        f"SSIM: median={ssim_median:.4f}, CI=[{ssim_med_low:.4f}, {ssim_med_high:.4f}], mean={ssim_mean:.4f}, std={ssim_std:.4f}\n"
+        f"LPIPS: median={lpips_median:.4f}, CI=[{lpips_med_low:.4f}, {lpips_med_high:.4f}], mean={lpips_mean:.4f}, std={lpips_std:.4f}"
+    )
     ax.text(
         0.02,
         0.98,
@@ -406,30 +467,28 @@ def main():
     plt.close()
 
     # ------------------------------------------------------------
-    # 5) Create separate plots with statistics (+ mean line)
+    # 5) Create separate plots with the new median-based approach
     # ------------------------------------------------------------
     plot_metric_separately("PSNR", psnr_array, args.out_dir)
     plot_metric_separately("SSIM", ssim_array, args.out_dir)
     plot_metric_separately("LPIPS", lpips_array, args.out_dir)
 
     # ------------------------------------------------------------
-    # 6) Identify and print the longest stable runs
+    # 6) Identify and print the longest "strikes"
+    #    (consecutive frames within/better than the median's 95% CI)
     # ------------------------------------------------------------
-    # Adjust these thresholds as needed
-    psnr_thresh = 0.1
-    ssim_thresh = 0.01
-    lpips_thresh = 0.01
+    # For PSNR & SSIM, "better" means >= lower bound of median CI
+    # For LPIPS, "better" means <= upper bound of median CI
+    strikes = find_long_strikes(
+        psnr_array, ssim_array, lpips_array,
+        psnr_med_low, ssim_med_low, lpips_med_high
+    )
 
-    stable_runs = find_stable_runs(psnr_array, ssim_array, lpips_array,
-                                   psnr_thresh=psnr_thresh,
-                                   ssim_thresh=ssim_thresh,
-                                   lpips_thresh=lpips_thresh)
-
-    print("\nStable runs (longest first):")
+    print("\nLongest strikes (ordered by descending length):")
     # Print the top 5 runs, or all if fewer than 5
-    for (start, end) in stable_runs[:5]:
+    for (start, end) in strikes[:5]:
         length = end - start + 1
-        print(f"  From {start} to {end} (length = {length})")
+        print(f"  From frame {start} to frame {end} (length = {length})")
 
     print("\nDone!")
 
