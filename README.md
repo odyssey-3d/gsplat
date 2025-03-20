@@ -45,6 +45,14 @@ The images and masks (if available) must have the following folder structure
 ```
 Attention, the colmap loading dependency has a bug and does not properly work with the txt format. Only *.bin are working properly.
 
+# Metrics
+Example how to run it:
+```bash
+python examples/render_gt.py \
+    --colmap_dir /home/user/data/scene \ # colmap directory, needs gt data
+    --ply_path /home/user/scene/ckpts/gaussian_step_29999.ply \
+    --out_dir ./gt_render
+```
 
 # gsplat
 
