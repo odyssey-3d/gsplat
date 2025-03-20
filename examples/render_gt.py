@@ -121,11 +121,14 @@ def plot_metric_separately(name, values, out_dir):
     Plots the given metric in two subplots:
       1) A line plot over image index (with statistics).
       2) A histogram of values.
-    Statistics are displayed in the top subplot.
+
+    - Draws a mean line on the top subplot.
+    - Shows stats (mean, median, std, var, min, max).
     """
     mean_val = values.mean()
     median_val = np.median(values)
     std_val = values.std()
+    var_val = values.var()
     min_val = values.min()
     max_val = values.max()
 
@@ -133,8 +136,11 @@ def plot_metric_separately(name, values, out_dir):
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
 
-    # Line plot
+    # Plot main metric vs index
     ax1.plot(indices, values, marker='o', label=name)
+    # Draw horizontal mean line
+    ax1.axhline(y=mean_val, label="Mean")
+
     ax1.set_title(f"{name} vs. Image Index")
     ax1.set_xlabel("Image Index")
     ax1.set_ylabel(name)
@@ -145,6 +151,7 @@ def plot_metric_separately(name, values, out_dir):
         f"Mean:   {mean_val:.4f}",
         f"Median: {median_val:.4f}",
         f"Std:    {std_val:.4f}",
+        f"Var:    {var_val:.4f}",
         f"Min:    {min_val:.4f}",
         f"Max:    {max_val:.4f}",
     ])
@@ -160,7 +167,7 @@ def plot_metric_separately(name, values, out_dir):
     )
 
     # Histogram
-    ax2.hist(values, bins=20, alpha=0.7, color="g")
+    ax2.hist(values, bins=20, alpha=0.7)
     ax2.set_title(f"{name} Distribution")
     ax2.set_xlabel(f"{name} Value")
     ax2.set_ylabel("Frequency")
@@ -168,6 +175,34 @@ def plot_metric_separately(name, values, out_dir):
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, f"{name.lower()}_analysis.png"))
     plt.close()
+
+def find_stable_runs(psnr, ssim, lpips, psnr_thresh=0.1, ssim_thresh=0.01, lpips_thresh=0.01):
+    """
+    Find the runs (start_index, end_index) of consecutive frames where
+    the absolute changes in each metric between consecutive frames do not
+    exceed the given thresholds. Each run is inclusive of start and end indices.
+    """
+    stable_runs = []
+    if len(psnr) == 0:
+        return stable_runs
+
+    start_idx = 0
+    for i in range(len(psnr) - 1):
+        # Check changes for the three metrics from frame i to i+1
+        if (abs(psnr[i+1] - psnr[i]) > psnr_thresh or
+            abs(ssim[i+1] - ssim[i]) > ssim_thresh or
+            abs(lpips[i+1] - lpips[i]) > lpips_thresh):
+            # We have exceeded the threshold => end the current stable run
+            stable_runs.append((start_idx, i))
+            start_idx = i + 1
+
+    # Don't forget the final run
+    stable_runs.append((start_idx, len(psnr) - 1))
+
+    # Sort runs by descending length
+    stable_runs.sort(key=lambda r: (r[1] - r[0] + 1), reverse=True)
+
+    return stable_runs
 
 def main():
     parser = argparse.ArgumentParser(
@@ -326,30 +361,77 @@ def main():
     # 4) Plot combined metrics evolution (PSNR, SSIM, LPIPS)
     # ------------------------------------------------------------
     indices = np.arange(len(trainset))
+    psnr_array = np.array(psnr_vals)
+    ssim_array = np.array(ssim_vals)
+    lpips_array = np.array(lpips_vals)
+
+    # Compute stats for each metric
+    psnr_mean, psnr_median = psnr_array.mean(), np.median(psnr_array)
+    psnr_std, psnr_var = psnr_array.std(), psnr_array.var()
+
+    ssim_mean, ssim_median = ssim_array.mean(), np.median(ssim_array)
+    ssim_std, ssim_var = ssim_array.std(), ssim_array.var()
+
+    lpips_mean, lpips_median = lpips_array.mean(), np.median(lpips_array)
+    lpips_std, lpips_var = lpips_array.std(), lpips_array.var()
+
     plt.figure(figsize=(10, 6))
-    plt.plot(indices, psnr_vals, label="PSNR")
-    plt.plot(indices, ssim_vals, label="SSIM")
-    plt.plot(indices, lpips_vals, label="LPIPS")
+    plt.plot(indices, psnr_array, label="PSNR")
+    plt.plot(indices, ssim_array, label="SSIM")
+    plt.plot(indices, lpips_array, label="LPIPS")
     plt.xlabel("Image Index")
     plt.ylabel("Metric Value")
     plt.title("Metrics Evolution over Training Images")
     plt.legend()
+
+    # Add a text box with summary stats
+    text_stats = (
+        f"PSNR: mean={psnr_mean:.4f}, median={psnr_median:.4f}, std={psnr_std:.4f}, var={psnr_var:.4f}\n"
+        f"SSIM: mean={ssim_mean:.4f}, median={ssim_median:.4f}, std={ssim_std:.4f}, var={ssim_var:.4f}\n"
+        f"LPIPS: mean={lpips_mean:.4f}, median={lpips_median:.4f}, std={lpips_std:.4f}, var={lpips_var:.4f}"
+    )
+    ax = plt.gca()
+    ax.text(
+        0.02,
+        0.98,
+        text_stats,
+        transform=ax.transAxes,
+        fontsize=9,
+        verticalalignment="top",
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+    )
+
     plt.tight_layout()
     plt.savefig(os.path.join(args.out_dir, "metrics_evolution.png"))
     plt.close()
 
     # ------------------------------------------------------------
-    # 5) Create separate plots with statistics
+    # 5) Create separate plots with statistics (+ mean line)
     # ------------------------------------------------------------
-    psnr_array = np.array(psnr_vals)
-    ssim_array = np.array(ssim_vals)
-    lpips_array = np.array(lpips_vals)
-
     plot_metric_separately("PSNR", psnr_array, args.out_dir)
     plot_metric_separately("SSIM", ssim_array, args.out_dir)
     plot_metric_separately("LPIPS", lpips_array, args.out_dir)
 
-    print("Done!")
+    # ------------------------------------------------------------
+    # 6) Identify and print the longest stable runs
+    # ------------------------------------------------------------
+    # Adjust these thresholds as needed
+    psnr_thresh = 0.1
+    ssim_thresh = 0.01
+    lpips_thresh = 0.01
+
+    stable_runs = find_stable_runs(psnr_array, ssim_array, lpips_array,
+                                   psnr_thresh=psnr_thresh,
+                                   ssim_thresh=ssim_thresh,
+                                   lpips_thresh=lpips_thresh)
+
+    print("\nStable runs (longest first):")
+    # Print the top 5 runs, or all if fewer than 5
+    for (start, end) in stable_runs[:5]:
+        length = end - start + 1
+        print(f"  From {start} to {end} (length = {length})")
+
+    print("\nDone!")
 
 if __name__ == "__main__":
     main()
