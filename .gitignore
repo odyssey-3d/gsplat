@@ -1,8 +1,12 @@
+.idea
 .clangd
 compile_commands.json
 
 # Visual Studio Code configs.
 .vscode/
+
+# Pycharme config
+.idea
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
