@@ -8,19 +8,12 @@ import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from fused_ssim import fused_ssim
 from typing import Optional
-from tqdm import tqdm  # for the progress bar
+from tqdm import tqdm
 
-# ----------------------------------------------------------------
-# Adjust these imports to match your environment:
 from datasets.colmap import Parser, Dataset
 from gsplat.rendering import rasterization
-
-# TorchMetrics
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchmetrics.image import PeakSignalNoiseRatio
-# ----------------------------------------------------------------
-
-# For computing bootstrap confidence intervals:
 from scipy.stats import bootstrap
 
 @dataclass
@@ -133,11 +126,13 @@ def compute_median_confidence_interval(data, confidence=0.95, n_resamples=10000)
     return res.confidence_interval.low, res.confidence_interval.high
 
 
-def plot_metric_separately(name, values, out_dir):
+def plot_metric_separately(name, values, out_dir, strikes=None):
     """
     Plots the given metric in two subplots:
       1) A line plot over image index (with statistics + 95% CI for the median).
       2) A histogram of values.
+
+    Optionally highlights 'strikes' as vertical spans.
 
     - Draws a median line on the top subplot.
     - Shows stats (mean, median, std, var, min, max).
@@ -165,12 +160,15 @@ def plot_metric_separately(name, values, out_dir):
     # Add a horizontal band for the 95% CI of the median
     ax1.axhspan(ci_low, ci_high, color='orange', alpha=0.2, label="95% CI (Median)")
 
+    if strikes is not None:
+        for (start_idx, end_idx) in strikes:
+            ax1.axvspan(start_idx, end_idx, color='yellow', alpha=0.1)
+
     ax1.set_title(f"{name} vs. Image Index")
     ax1.set_xlabel("Image Index")
     ax1.set_ylabel(name)
     ax1.legend(loc="best")
 
-    # Build a string for stats
     stats_str = "\n".join([
         f"Median:  {median_val:.4f}",
         f"Mean:    {mean_val:.4f}",
@@ -206,19 +204,16 @@ def find_long_strikes(psnr_array, ssim_array, lpips_array,
                       psnr_med_low, ssim_med_low, lpips_med_high):
     """
     A "long strike" is defined as a consecutive set of frames for which:
-      - PSNR >= psnr_med_low  (because higher is better than or at median lower bound)
+      - PSNR >= psnr_med_low
       - SSIM >= ssim_med_low
-      - LPIPS <= lpips_med_high (lower is better, so we check if it's below median upper bound)
+      - LPIPS <= lpips_med_high
 
-    We gather all consecutive frames that meet these criteria, then
-    return them sorted by descending length (end_index - start_index + 1).
+    Returns a list of (start_frame, end_frame), sorted by descending length.
     """
-
     n = len(psnr_array)
     if n == 0:
         return []
 
-    # Build a boolean mask "good_mask": True if frame meets the conditions, False otherwise.
     good_mask = (
         (psnr_array >= psnr_med_low) &
         (ssim_array >= ssim_med_low) &
@@ -229,11 +224,9 @@ def find_long_strikes(psnr_array, ssim_array, lpips_array,
     strike_start = None
     for i in range(n):
         if good_mask[i]:
-            # Start of a strike (or continuation) if not already started
             if strike_start is None:
                 strike_start = i
         else:
-            # End of a strike if we had started one
             if strike_start is not None:
                 strikes.append((strike_start, i - 1))
                 strike_start = None
@@ -245,6 +238,29 @@ def find_long_strikes(psnr_array, ssim_array, lpips_array,
     # Sort by length descending
     strikes.sort(key=lambda x: (x[1] - x[0] + 1), reverse=True)
     return strikes
+
+def create_strike_stripe(out_dir, strike_index, start, end):
+    """
+    Reads each 'compare_{i:04d}.png' for i in [start, end], horizontally
+    concatenates them, and saves as 'strike_{strike_index}_{start}_{end}.png'.
+    """
+    images = []
+    for i in range(start, end + 1):
+        compare_path = os.path.join(out_dir, f"compare_{i:04d}.png")
+        if not os.path.exists(compare_path):
+            # If compare images might not exist for some reason, skip
+            continue
+        img = imageio.imread(compare_path)
+        images.append(img)
+
+    if len(images) == 0:
+        return
+
+    # Concatenate along width axis
+    stripe = np.concatenate(images, axis=1)
+    strike_filename = f"strike_{strike_index}_{start}_{end}.png"
+    out_path = os.path.join(out_dir, strike_filename)
+    imageio.imwrite(out_path, stripe)
 
 
 def main():
@@ -373,7 +389,7 @@ def main():
                 f"Render range: [{rendered_torch.min()}, {rendered_torch.max()}]"
             )
 
-        # Compute metrics as scalars (floats)
+        # Compute metrics as scalars
         psnr_val = psnr_metric(rendered_torch, gt_torch).item()
         ssim_val_tensor = fused_ssim(rendered_torch, gt_torch)
         if isinstance(ssim_val_tensor, torch.Tensor):
@@ -386,7 +402,7 @@ def main():
         ssim_vals.append(ssim_val)
         lpips_vals.append(lpips_val)
 
-        # Create side-by-side comparison image: [H, W*2, 3] in [0..255]
+        # Create side-by-side comparison
         render_img_np = render_img_cpu.numpy()  # [H, W, 3], float [0..1]
         render_img_np_255 = (render_img_np * 255).astype(np.uint8)
 
@@ -401,7 +417,7 @@ def main():
         imageio.imwrite(compare_path, compare_img)
 
     # ------------------------------------------------------------
-    # 4) Plot combined metrics evolution (PSNR, SSIM, LPIPS) with median + 95% CI
+    # Gather metric arrays
     # ------------------------------------------------------------
     indices = np.arange(len(trainset))
     psnr_array = np.array(psnr_vals)
@@ -418,7 +434,7 @@ def main():
     ssim_med_low, ssim_med_high = compute_median_confidence_interval(ssim_array)
     lpips_med_low, lpips_med_high = compute_median_confidence_interval(lpips_array)
 
-    # We'll still compute mean/std for reference if desired
+    # We'll still compute mean/std for reference
     psnr_mean = psnr_array.mean()
     psnr_std = psnr_array.std()
     ssim_mean = ssim_array.mean()
@@ -426,6 +442,18 @@ def main():
     lpips_mean = lpips_array.mean()
     lpips_std = lpips_array.std()
 
+    # ------------------------------------------------------------
+    # 6) Identify the "strikes" FIRST so we can visualize them
+    # ------------------------------------------------------------
+    strikes = find_long_strikes(
+        psnr_array, ssim_array, lpips_array,
+        psnr_med_low, ssim_med_low, lpips_med_high
+    )
+
+    # ------------------------------------------------------------
+    # 7) Plot combined metrics evolution (PSNR, SSIM, LPIPS),
+    #    highlighting the strikes.
+    # ------------------------------------------------------------
     plt.figure(figsize=(10, 6))
     ax = plt.gca()
 
@@ -441,6 +469,9 @@ def main():
     ax.plot(indices, lpips_array, label="LPIPS", color='red')
     ax.axhline(y=lpips_median, color='red', linestyle='--', label="LPIPS Median")
     ax.axhspan(lpips_med_low, lpips_med_high, color='red', alpha=0.05, label="LPIPS 95% CI (Median)")
+
+    for (start_idx, end_idx) in strikes:
+        ax.axvspan(start_idx, end_idx, color='yellow', alpha=0.1)
 
     ax.set_xlabel("Image Index")
     ax.set_ylabel("Metric Value")
@@ -467,28 +498,23 @@ def main():
     plt.close()
 
     # ------------------------------------------------------------
-    # 5) Create separate plots with the new median-based approach
+    # 8) Create separate plots for PSNR, SSIM, LPIPS with highlight
     # ------------------------------------------------------------
-    plot_metric_separately("PSNR", psnr_array, args.out_dir)
-    plot_metric_separately("SSIM", ssim_array, args.out_dir)
-    plot_metric_separately("LPIPS", lpips_array, args.out_dir)
+    plot_metric_separately("PSNR", psnr_array, args.out_dir, strikes=strikes)
+    plot_metric_separately("SSIM", ssim_array, args.out_dir, strikes=strikes)
+    plot_metric_separately("LPIPS", lpips_array, args.out_dir, strikes=strikes)
 
     # ------------------------------------------------------------
-    # 6) Identify and print the longest "strikes"
-    #    (consecutive frames within/better than the median's 95% CI)
+    # 9) Print the longest strikes and create stripes
     # ------------------------------------------------------------
-    # For PSNR & SSIM, "better" means >= lower bound of median CI
-    # For LPIPS, "better" means <= upper bound of median CI
-    strikes = find_long_strikes(
-        psnr_array, ssim_array, lpips_array,
-        psnr_med_low, ssim_med_low, lpips_med_high
-    )
-
     print("\nLongest strikes (ordered by descending length):")
-    # Print the top 5 runs, or all if fewer than 5
-    for (start, end) in strikes[:5]:
+    top_strikes = strikes[:5]  # print/make stripes for top 5
+    for idx, (start, end) in enumerate(top_strikes):
         length = end - start + 1
         print(f"  From frame {start} to frame {end} (length = {length})")
+
+    for idx, (start, end) in enumerate(top_strikes):
+        create_strike_stripe(args.out_dir, idx, start, end)
 
     print("\nDone!")
 
