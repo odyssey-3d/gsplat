@@ -5,6 +5,7 @@ import numpy as np
 import open3d as o3d
 import cv2
 import matplotlib.pyplot as plt
+import json
 from dataclasses import dataclass
 from fused_ssim import fused_ssim
 from typing import Optional
@@ -514,6 +515,62 @@ def main():
     for idx, (start, end) in enumerate(top_strikes):
         create_strike_stripe(args.out_dir, idx, start, end)
 
+    # ------------------------------------------------------------
+    # 10) Create a JSON summary report
+    # ------------------------------------------------------------
+    # Per-image metrics
+    per_image_metrics = []
+    for i in range(n):
+        per_image_metrics.append({
+            "index": i,
+            "psnr": float(psnr_array[i]),
+            "ssim": float(ssim_array[i]),
+            "lpips": float(lpips_array[i])
+        })
+
+    # Full strikes info
+    strikes_list = []
+    for (start_idx, end_idx) in strikes:
+        strikes_list.append({
+            "start_idx": start_idx,
+            "end_idx": end_idx
+        })
+
+    # Build the final JSON structure
+    json_report = {
+        "per_image": per_image_metrics,
+        "summary_statistics": {
+            "psnr": {
+                "median": float(psnr_median),
+                "ci_low": float(psnr_med_low),
+                "ci_high": float(psnr_med_high),
+                "mean": float(psnr_mean),
+                "std": float(psnr_std)
+            },
+            "ssim": {
+                "median": float(ssim_median),
+                "ci_low": float(ssim_med_low),
+                "ci_high": float(ssim_med_high),
+                "mean": float(ssim_mean),
+                "std": float(ssim_std)
+            },
+            "lpips": {
+                "median": float(lpips_median),
+                "ci_low": float(lpips_med_low),
+                "ci_high": float(lpips_med_high),
+                "mean": float(lpips_mean),
+                "std": float(lpips_std)
+            }
+        },
+        "strikes": strikes_list
+    }
+
+    # Write out the JSON report
+    json_path = os.path.join(args.out_dir, "metrics_summary.json")
+    with open(json_path, "w") as f:
+        json.dump(json_report, f, indent=2)
+
+    print("\nJSON summary report saved to:", json_path)
     print("\nDone!")
 
 
