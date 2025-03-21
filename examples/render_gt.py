@@ -3,18 +3,20 @@ import os
 import torch
 import numpy as np
 import open3d as o3d
-import imageio
+import cv2
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from fused_ssim import fused_ssim
 from typing import Optional
 from tqdm import tqdm
+from torch.utils.data import DataLoader
 
 from datasets.colmap import Parser, Dataset
 from gsplat.rendering import rasterization
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchmetrics.image import PeakSignalNoiseRatio
 from scipy.stats import bootstrap
+
 
 @dataclass
 class GaussianData:
@@ -25,6 +27,7 @@ class GaussianData:
     scaling: torch.Tensor  # (N, 3)
     rotation: torch.Tensor  # (N, 4) quaternions
     opacity: torch.Tensor  # (N,)
+
 
 def load_ply(filepath: str) -> GaussianData:
     """
@@ -97,7 +100,7 @@ def load_ply(filepath: str) -> GaussianData:
             features_dc = (
                 torch.tensor(color_inverted, dtype=torch.float32, device="cuda")
                 .unsqueeze(1)
-            )  # (N,1,3)
+            )
             features_rest = None
     else:
         raise ValueError("No f_dc_ attributes found in the PLY file")
@@ -119,10 +122,14 @@ def compute_median_confidence_interval(data, confidence=0.95, n_resamples=10000)
     Returns (ci_low, ci_high).
     """
     data = np.array(data, dtype=float)  # ensure float
-    # SciPy's bootstrap for the median (BCa method for better accuracy):
-    # This requires scipy >= 1.7.0, or specifically >= 1.10 for 'BCa' method.
-    res = bootstrap((data,), np.median, confidence_level=confidence,
-                    n_resamples=n_resamples, method='BCa', random_state=123)
+    res = bootstrap(
+        (data,),
+        np.median,
+        confidence_level=confidence,
+        n_resamples=n_resamples,
+        method='BCa',
+        random_state=123
+    )
     return res.confidence_interval.low, res.confidence_interval.high
 
 
@@ -145,19 +152,14 @@ def plot_metric_separately(name, values, out_dir, strikes=None):
     min_val = values.min()
     max_val = values.max()
 
-    # Compute 95% CI for the median
     ci_low, ci_high = compute_median_confidence_interval(values, confidence=0.95)
 
     indices = np.arange(len(values))
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
 
-    # Plot metric vs. index
     ax1.plot(indices, values, marker='o', label=name, color='blue', alpha=0.7)
-    # Draw horizontal median line
     ax1.axhline(y=median_val, color='red', linestyle='--', label="Median")
-
-    # Add a horizontal band for the 95% CI of the median
     ax1.axhspan(ci_low, ci_high, color='orange', alpha=0.2, label="95% CI (Median)")
 
     if strikes is not None:
@@ -176,9 +178,8 @@ def plot_metric_separately(name, values, out_dir, strikes=None):
         f"Var:     {var_val:.4f}",
         f"Min:     {min_val:.4f}",
         f"Max:     {max_val:.4f}",
-        f"95% CI (Median): [{ci_low:.4f}, {ci_high:.4f}]"
+        f"95% CI: [{ci_low:.4f}, {ci_high:.4f}]"
     ])
-    # Place stats in the top-left corner of the upper subplot
     ax1.text(
         0.05,
         0.95,
@@ -189,7 +190,6 @@ def plot_metric_separately(name, values, out_dir, strikes=None):
         bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
     )
 
-    # Histogram
     ax2.hist(values, bins=20, alpha=0.7, color='blue', edgecolor='black')
     ax2.set_title(f"{name} Distribution")
     ax2.set_xlabel(f"{name} Value")
@@ -203,12 +203,10 @@ def plot_metric_separately(name, values, out_dir, strikes=None):
 def find_long_strikes(psnr_array, ssim_array, lpips_array,
                       psnr_med_low, ssim_med_low, lpips_med_high):
     """
-    A "long strike" is defined as a consecutive set of frames for which:
+    A "long strike" is a consecutive set of frames for which:
       - PSNR >= psnr_med_low
       - SSIM >= ssim_med_low
       - LPIPS <= lpips_med_high
-
-    Returns a list of (start_frame, end_frame), sorted by descending length.
     """
     n = len(psnr_array)
     if n == 0:
@@ -230,8 +228,6 @@ def find_long_strikes(psnr_array, ssim_array, lpips_array,
             if strike_start is not None:
                 strikes.append((strike_start, i - 1))
                 strike_start = None
-
-    # If still in a strike at the end:
     if strike_start is not None:
         strikes.append((strike_start, n - 1))
 
@@ -239,125 +235,133 @@ def find_long_strikes(psnr_array, ssim_array, lpips_array,
     strikes.sort(key=lambda x: (x[1] - x[0] + 1), reverse=True)
     return strikes
 
+
 def create_strike_stripe(out_dir, strike_index, start, end):
     """
-    Reads each 'compare_{i:04d}.png' for i in [start, end], horizontally
-    concatenates them, and saves as 'strike_{strike_index}_{start}_{end}.png'.
+    Reads each 'compare_{i:04d}.png' in [start,end], horizontally concatenates,
+    and saves 'strike_{strike_index}_{start}_{end}.png'.
     """
     images = []
     for i in range(start, end + 1):
         compare_path = os.path.join(out_dir, f"compare_{i:04d}.png")
         if not os.path.exists(compare_path):
-            # If compare images might not exist for some reason, skip
             continue
-        img = imageio.imread(compare_path)
+        img = cv2.imread(compare_path)  # Use cv2 instead of imageio
         images.append(img)
 
     if len(images) == 0:
         return
 
-    # Concatenate along width axis
     stripe = np.concatenate(images, axis=1)
     strike_filename = f"strike_{strike_index}_{start}_{end}.png"
     out_path = os.path.join(out_dir, strike_filename)
-    imageio.imwrite(out_path, stripe)
+    cv2.imwrite(out_path, stripe)  # Use cv2 instead of imageio
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Render (via Gaussians) and compare with GT images. Save only the side-by-side comparisons."
+        description="Render Gaussians vs. GT images using a DataLoader in parallel."
     )
-    parser.add_argument(
-        "--colmap_dir",
-        type=str,
-        required=True,
-        help="Path to the COLMAP data (images, sparse, etc.).",
-    )
-    parser.add_argument(
-        "--ply_path",
-        type=str,
-        required=True,
-        help="Path to the .ply file of your Gaussian splats.",
-    )
-    parser.add_argument(
-        "--out_dir",
-        type=str,
-        required=True,
-        help="Folder where to save comparison images and plots.",
-    )
-    parser.add_argument(
-        "--factor", type=int, default=1, help="Downsample factor for loading dataset."
-    )
+    parser.add_argument("--colmap_dir", type=str, required=True)
+    parser.add_argument("--ply_path", type=str, required=True)
+    parser.add_argument("--out_dir", type=str, required=True)
+    parser.add_argument("--factor", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--save_comparisons", action="store_true", default=False,
+                        help="Save side-by-side comparison images (default: False)")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # 1) Load the COLMAP dataset (training split)
+    # --------------------------------------------------
+    # 1) Prepare dataset & dataloader
+    # --------------------------------------------------
+    print("Creating dataset/dataloader with your snippet:")
     colmap_parser = Parser(
         data_dir=args.colmap_dir,
         factor=args.factor,
-        normalize=False,  # Must match your training usage
-        test_every=-1,   # put all images into "train" for demonstration
+        normalize=False,
+        test_every=-1,
     )
     trainset = Dataset(colmap_parser, split="train")
 
-    # 2) Load the Gaussians from .ply
+    trainloader = DataLoader(
+        trainset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=1,
+        pin_memory=True,
+        persistent_workers=True
+    )
+    trainloader_iter = iter(trainloader)
+
+    # --------------------------------------------------
+    # 2) Load your Gaussians from PLY
+    # --------------------------------------------------
     gaussians = load_ply(args.ply_path)
     device = "cuda"
-
-    # Convert log-params to actual
     means = gaussians.xyz.to(device)
     scales = torch.exp(gaussians.scaling).to(device)
     quats = gaussians.rotation.to(device)
     opacities = torch.sigmoid(gaussians.opacity).to(device).squeeze(-1)
 
-    # Merge DC + higher-order features
     if gaussians.features_rest is not None:
         colors = torch.cat([gaussians.features_dc, gaussians.features_rest], dim=1).to(device)
     else:
         colors = gaussians.features_dc.to(device)
 
-    # Initialize metrics
+    # --------------------------------------------------
+    # 3) Set up metrics & accumulators
+    # --------------------------------------------------
     lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type="alex", normalize=True).to(device)
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
 
-    # Lists to store metrics
+    # We'll gather them in lists
     psnr_vals = []
     ssim_vals = []
     lpips_vals = []
 
-    # 3) Render each training image, compute metrics, and save side-by-side
-    for i in tqdm(range(len(trainset)), desc="Rendering & Saving Comparisons"):
-        example = trainset[i]
+    # --------------------------------------------------
+    # 4) Main loop with progress bar
+    # --------------------------------------------------
+    print("Processing images...")
+    for i, data in tqdm(enumerate(trainloader), total=len(trainloader), desc="Rendering Progress"):
+        camtoworld = data["camtoworld"].to(device)  # [B,4,4]
+        Ks = data["K"].to(device)                   # [B,3,3]
+        images = data["image"]                      # [B, H, W, 3] or [B,3,H,W]
+        # We'll do a minimal example, assume batch_size=1 for illustration
+        # If batch_size>1, you'd loop or do everything in parallel.
 
-        camtoworld = example["camtoworld"].to(device)  # [4,4]
-        K = example["K"].to(device)                    # [3,3]
+        # Convert images to float [0..1]
+        if images.dtype == torch.uint8:
+            images = images.float()
+        if images.max() > 1.0:
+            images = images / 255.0
+        images = images.to(device)
 
-        gt_img = example["image"]  # shape [H, W, 3] or [3, H, W]
-        # Ensure GT is float in [0..1]
-        if gt_img.dtype == torch.uint8:
-            gt_img = gt_img.float()
-        if gt_img.max() > 1.0:
-            gt_img = gt_img / 255.0
-
-        # Figure out shape (H, W)
-        if gt_img.ndim == 3 and gt_img.shape[-1] == 3:
-            H, W = gt_img.shape[:2]  # [H, W, 3]
-        elif gt_img.ndim == 3 and gt_img.shape[0] == 3:
-            H, W = gt_img.shape[1], gt_img.shape[2]  # [3, H, W]
+        # Suppose batch_size=1 for clarity
+        # shape => [1, H, W, 3] or [1,3,H,W]
+        if images.ndim == 4 and images.shape[-1] == 3:
+            # => [1,H,W,3]
+            H, W = images.shape[1], images.shape[2]
+            gt_img = images  # [1,H,W,3]
+            # make sure shape is consistent
         else:
-            raise ValueError(f"Unexpected GT shape: {gt_img.shape}")
+            # => [1,3,H,W]
+            _, _, H, W = images.shape
+            # might need to permute if your dataset is different
+            gt_img = images.permute(0, 2, 3, 1)  # => [1,H,W,3]
 
-        # Render via rasterization
+        # Now do the rendering
         with torch.no_grad():
-            rendered, alphas, _ = rasterization(
+            rendered_batch, alphas, _ = rasterization(
                 means=means,
                 quats=quats,
                 scales=scales,
                 opacities=opacities,
                 colors=colors,
-                viewmats=torch.linalg.inv(camtoworld)[None],
-                Ks=K[None],
+                viewmats=torch.linalg.inv(camtoworld),  # [B,4,4]
+                Ks=Ks,                                  # [B,3,3]
                 width=W,
                 height=H,
                 sh_degree=3,
@@ -368,73 +372,68 @@ def main():
                 sparse_grad=False,
                 rasterize_mode="classic",
             )
-        # rendered => [1, H, W, 3]
-        render_img = rendered[0].clamp(0.0, 1.0)  # [H, W, 3]
-        render_img_cpu = render_img.cpu()
 
-        # Prepare GT for metrics: [1, 3, H, W]
-        if gt_img.ndim == 3 and gt_img.shape[-1] == 3:
-            gt_torch = gt_img.permute(2, 0, 1).unsqueeze(0).to(device)
-        else:
-            gt_torch = gt_img.unsqueeze(0).to(device)
+        # rendered_batch => [B, H, W, 3]
+        # If B=1, shape => [1, H, W, 3]
+        rendered = rendered_batch[0].clamp(0.0, 1.0)  # => [H, W, 3]
 
-        # Prepare render for metrics: [1, 3, H, W]
-        rendered_torch = render_img_cpu.permute(2, 0, 1).unsqueeze(0).to(device)
+        # Prepare for metric calc
+        # Must be => [1,3,H,W]
+        gt_torch = gt_img.permute(0, 3, 1, 2)  # => [1,3,H,W]
+        rend_torch = rendered.unsqueeze(0).permute(0, 3, 1, 2).to(device)  # => [1,3,H,W]
 
-        # Safety check
-        if gt_torch.max() > 1.0 or rendered_torch.max() > 1.0:
-            raise ValueError(
-                "Either GT or Render is above 1.0. Ensure both are normalized to [0..1].\n"
-                f"GT range: [{gt_torch.min()}, {gt_torch.max()}], "
-                f"Render range: [{rendered_torch.min()}, {rendered_torch.max()}]"
-            )
-
-        # Compute metrics as scalars
-        psnr_val = psnr_metric(rendered_torch, gt_torch).item()
-        ssim_val_tensor = fused_ssim(rendered_torch, gt_torch)
+        # Metrics
+        psnr_val = psnr_metric(rend_torch, gt_torch).item()
+        ssim_val_tensor = fused_ssim(rend_torch, gt_torch)
         if isinstance(ssim_val_tensor, torch.Tensor):
             ssim_val = ssim_val_tensor.item()
         else:
             ssim_val = float(ssim_val_tensor)
-        lpips_val = lpips_metric(rendered_torch, gt_torch).item()
+        lpips_val = lpips_metric(rend_torch, gt_torch).item()
 
         psnr_vals.append(psnr_val)
         ssim_vals.append(ssim_val)
         lpips_vals.append(lpips_val)
 
-        # Create side-by-side comparison
-        render_img_np = render_img_cpu.numpy()  # [H, W, 3], float [0..1]
-        render_img_np_255 = (render_img_np * 255).astype(np.uint8)
+        # Optional side-by-side comparison
+        if args.save_comparisons:
+            # Convert rendered image to numpy uint8
+            rendered_cpu = rendered.cpu().numpy()  # [H, W, 3], float [0..1]
+            rendered_np_255 = (rendered_cpu * 255).astype(np.uint8)
 
-        gt_img_cpu = gt_img.cpu()
-        if gt_img_cpu.ndim == 3 and gt_img_cpu.shape[0] == 3:
-            gt_img_cpu = gt_img_cpu.permute(1, 2, 0)
-        gt_img_np = gt_img_cpu.numpy()  # [H, W, 3], float [0..1]
-        gt_img_np_255 = (gt_img_np * 255).astype(np.uint8)
+            # Convert ground truth image to numpy uint8
+            gt_img_cpu = gt_img.squeeze(0).cpu()  # [H, W, 3] or adjust if needed
+            gt_np_255 = (gt_img_cpu.numpy() * 255).astype(np.uint8)
 
-        compare_img = np.concatenate((gt_img_np_255, render_img_np_255), axis=1)
-        compare_path = os.path.join(args.out_dir, f"compare_{i:04d}.png")
-        imageio.imwrite(compare_path, compare_img)
+            # Concatenate horizontally (GT | Rendered)
+            compare_img = np.concatenate((gt_np_255, rendered_np_255), axis=1)
+            compare_path = os.path.join(args.out_dir, f"compare_{i:04d}.png")
+            cv2.imwrite(compare_path, cv2.cvtColor(compare_img, cv2.COLOR_RGB2BGR))  # Convert RGB to BGR for OpenCV
 
     # ------------------------------------------------------------
-    # Gather metric arrays
+    # 5) After loop: compute final stats & plots
     # ------------------------------------------------------------
-    indices = np.arange(len(trainset))
     psnr_array = np.array(psnr_vals)
     ssim_array = np.array(ssim_vals)
     lpips_array = np.array(lpips_vals)
+    n = len(psnr_array)
+    indices = np.arange(n)
+
+    if n == 0:
+        print("No images processed, done!")
+        return
 
     # Median-based stats
     psnr_median = np.median(psnr_array)
     ssim_median = np.median(ssim_array)
     lpips_median = np.median(lpips_array)
 
-    # 95% CIs (median)
+    # 95% CI for each
     psnr_med_low, psnr_med_high = compute_median_confidence_interval(psnr_array)
     ssim_med_low, ssim_med_high = compute_median_confidence_interval(ssim_array)
     lpips_med_low, lpips_med_high = compute_median_confidence_interval(lpips_array)
 
-    # We'll still compute mean/std for reference
+    # Also compute mean/std
     psnr_mean = psnr_array.mean()
     psnr_std = psnr_array.std()
     ssim_mean = ssim_array.mean()
@@ -442,51 +441,52 @@ def main():
     lpips_mean = lpips_array.mean()
     lpips_std = lpips_array.std()
 
-    # ------------------------------------------------------------
-    # 6) Identify the "strikes" FIRST so we can visualize them
-    # ------------------------------------------------------------
+    # Identify "strikes"
     strikes = find_long_strikes(
-        psnr_array, ssim_array, lpips_array,
-        psnr_med_low, ssim_med_low, lpips_med_high
+        psnr_array,
+        ssim_array,
+        lpips_array,
+        psnr_med_low,
+        ssim_med_low,
+        lpips_med_high
     )
 
-    # ------------------------------------------------------------
-    # 7) Plot combined metrics evolution (PSNR, SSIM, LPIPS),
-    #    highlighting the strikes.
-    # ------------------------------------------------------------
+    # Plot combined metrics
     plt.figure(figsize=(10, 6))
     ax = plt.gca()
 
-    # Plot each metric's values
     ax.plot(indices, psnr_array, label="PSNR", color='blue')
     ax.axhline(y=psnr_median, color='blue', linestyle='--', label="PSNR Median")
-    ax.axhspan(psnr_med_low, psnr_med_high, color='blue', alpha=0.05, label="PSNR 95% CI (Median)")
+    ax.axhspan(psnr_med_low, psnr_med_high, color='blue', alpha=0.05)
 
     ax.plot(indices, ssim_array, label="SSIM", color='green')
     ax.axhline(y=ssim_median, color='green', linestyle='--', label="SSIM Median")
-    ax.axhspan(ssim_med_low, ssim_med_high, color='green', alpha=0.05, label="SSIM 95% CI (Median)")
+    ax.axhspan(ssim_med_low, ssim_med_high, color='green', alpha=0.05)
 
     ax.plot(indices, lpips_array, label="LPIPS", color='red')
     ax.axhline(y=lpips_median, color='red', linestyle='--', label="LPIPS Median")
-    ax.axhspan(lpips_med_low, lpips_med_high, color='red', alpha=0.05, label="LPIPS 95% CI (Median)")
+    ax.axhspan(lpips_med_low, lpips_med_high, color='red', alpha=0.05)
 
     for (start_idx, end_idx) in strikes:
         ax.axvspan(start_idx, end_idx, color='yellow', alpha=0.1)
 
-    ax.set_xlabel("Image Index")
+    ax.set_xlabel("Step Index")
     ax.set_ylabel("Metric Value")
     ax.set_title("Metrics Evolution (Median + 95% CI)")
     ax.legend(loc="best")
 
-    text_stats = (
-        f"PSNR: median={psnr_median:.4f}, CI=[{psnr_med_low:.4f}, {psnr_med_high:.4f}], mean={psnr_mean:.4f}, std={psnr_std:.4f}\n"
-        f"SSIM: median={ssim_median:.4f}, CI=[{ssim_med_low:.4f}, {ssim_med_high:.4f}], mean={ssim_mean:.4f}, std={ssim_std:.4f}\n"
-        f"LPIPS: median={lpips_median:.4f}, CI=[{lpips_med_low:.4f}, {lpips_med_high:.4f}], mean={lpips_mean:.4f}, std={lpips_std:.4f}"
+    stats_str = (
+        f"PSNR: median={psnr_median:.4f}, CI=[{psnr_med_low:.4f}, {psnr_med_high:.4f}], "
+        f"mean={psnr_mean:.4f}, std={psnr_std:.4f}\n"
+        f"SSIM: median={ssim_median:.4f}, CI=[{ssim_med_low:.4f}, {ssim_med_high:.4f}], "
+        f"mean={ssim_mean:.4f}, std={ssim_std:.4f}\n"
+        f"LPIPS: median={lpips_median:.4f}, CI=[{lpips_med_low:.4f}, {lpips_med_high:.4f}], "
+        f"mean={lpips_mean:.4f}, std={lpips_std:.4f}"
     )
     ax.text(
         0.02,
         0.98,
-        text_stats,
+        stats_str,
         transform=ax.transAxes,
         fontsize=9,
         verticalalignment="top",
@@ -497,9 +497,7 @@ def main():
     plt.savefig(os.path.join(args.out_dir, "metrics_evolution.png"))
     plt.close()
 
-    # ------------------------------------------------------------
-    # 8) Create separate plots for PSNR, SSIM, LPIPS with highlight
-    # ------------------------------------------------------------
+    # Separate plots for each metric
     plot_metric_separately("PSNR", psnr_array, args.out_dir, strikes=strikes)
     plot_metric_separately("SSIM", ssim_array, args.out_dir, strikes=strikes)
     plot_metric_separately("LPIPS", lpips_array, args.out_dir, strikes=strikes)
@@ -517,6 +515,7 @@ def main():
         create_strike_stripe(args.out_dir, idx, start, end)
 
     print("\nDone!")
+
 
 if __name__ == "__main__":
     main()
