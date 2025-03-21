@@ -31,9 +31,10 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     const at::Tensor tile_offsets, // [C, tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
     // outputs
-    at::Tensor renders, // [C, image_height, image_width, channels]
-    at::Tensor alphas,  // [C, image_height, image_width]
-    at::Tensor last_ids // [C, image_height, image_width]
+    at::Tensor renders,  // [C, image_height, image_width, channels]
+    at::Tensor alphas,   // [C, image_height, image_width]
+    at::Tensor last_ids, // [C, image_height, image_width]
+    at::Tensor pixels    // [C, N]
 );
 
 template <uint32_t CDIM>
