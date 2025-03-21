@@ -201,7 +201,7 @@ def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = No
     mean_pos = np.mean(means, axis=0)
     distances = np.linalg.norm(means - mean_pos, axis=1)
     std_dist = np.std(distances)
-    inliers = distances <= 4 * std_dist  # Points within 4 standard deviations
+    inliers = distances <= 6 * std_dist  # Points within 6 standard deviations
 
     # Filter all data arrays
     means = means[inliers]
@@ -474,7 +474,7 @@ class Runner:
             load_depths=cfg.depth_loss,
         )
         self.valset = Dataset(self.parser, split="val")
-        self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
+        self.scene_scale = self.parser.scene_scale * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
         # Model
