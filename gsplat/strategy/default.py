@@ -8,6 +8,7 @@ from .base import Strategy
 from .ops import remove, duplicate, split, split_edc
 from .ops import inject_noise_to_position_new
 from .ops import _update_param_with_optimizer
+from gsplat.utils import xyz_to_polar
 
 def multinomial_sample(weights: torch.Tensor, n: int) -> torch.Tensor:
     """
@@ -31,7 +32,7 @@ class DefaultStrategy(Strategy):
     min_opacity: float = 0.005
     grow_scale3d: float = 0.01
     grow_scale2d: float = 0.05
-    max_count: int = 10_000_000
+    max_count: int = 5_000_000
     noise_lr: float = 5e4
     prune_scale3d: float = 0.1
     prune_scale2d: float = 0.15
@@ -62,7 +63,7 @@ class DefaultStrategy(Strategy):
         optimizers: Dict[str, torch.optim.Optimizer],
     ):
         super().check_sanity(params, optimizers)
-        for key in ["means", "scales", "quats", "opacities"]:
+        for key in ["means", "scales", "quats", "opacities", "w"]:
             assert key in params, f"{key} is required in params but missing."
 
     def step_pre_backward(
@@ -185,18 +186,19 @@ class DefaultStrategy(Strategy):
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
         return n_prune
 
+
     @torch.no_grad()
     def _replace_pruned(
-        self,
-        params: Dict[str, torch.nn.Parameter],
-        optimizers: Dict[str, torch.optim.Optimizer],
-        state: Dict[str, torch.Tensor],
-        n_prune: int,
+            self,
+            params: Dict[str, torch.nn.Parameter],
+            optimizers: Dict[str, torch.optim.Optimizer],
+            state: Dict[str, torch.Tensor],
+            n_prune: int,
     ) -> int:
         """
         Replace pruned splats by sampling from alpha distribution of the remaining,
         then performing a shrink-and-offset logic for certain parameters:
-            - means: shift in-place, then duplicate with mirrored offset
+            - means: shift in 3D, then re-embed into homogeneous coords (subtract delta in-place, then append mirrored offset)
             - scales: subtract ln(sqrt(2)) in-place, then duplicate
             - opacities: alpha_new = 1 - sqrt(1 - alpha), then duplicate
             - quats: just copy old -> new
@@ -223,50 +225,84 @@ class DefaultStrategy(Strategy):
         scale_offset = math.log(math.sqrt(2.0))  # ~0.3466
         noise_std = 0.5
 
-        # 2) param_fn: Modify p[sampled_inds] in-place, then cat p[sampled_inds] to the end
+        # -----------------------------------------------------------
+        # Gather data in homogeneous coordinates for chosen splats
+        # -----------------------------------------------------------
+        # (1) Convert means to 3D: means_h is stored in homogeneous coords,
+        #     so we multiply by w_inv to get standard 3D coords for offset logic.
+        w_inv = 1.0 / torch.exp(params["w"][chosen_inds]).unsqueeze(1)  # [c, 1]
+        means_h_chosen = params["means"][chosen_inds]  # [c, 3]
+        means_3d = means_h_chosen * w_inv  # [c, 3]
+
+        # (2) Convert log scales + w to "true" 3D scaling
+        scales_log_chosen = params["scales"][chosen_inds]  # [c, 3] log-space
+        # Multiply by w_inv * norm(means_h) to get real 3D scale
+        s_3d = torch.exp(scales_log_chosen) * w_inv * torch.norm(means_h_chosen, dim=1, keepdim=True)  # [c, 3]
+
+        # (3) Draw random offsets in 3D
+        rand_delta = torch.randn_like(means_3d, device=device) * noise_std * s_3d  # [c, 3]
+
+        # (4) Compute updated/appended means in 3D
+        updated_3d = means_3d - rand_delta
+        appended_3d = means_3d + rand_delta
+
+        # (5) Re-embed updated/appended 3D coords back into homogeneous representation
+        _, updated_w, _ = xyz_to_polar(updated_3d)
+        updated_means_h = updated_3d * updated_w.unsqueeze(1)
+        _, appended_w, _ = xyz_to_polar(appended_3d)
+        appended_means_h = appended_3d * appended_w.unsqueeze(1)
+
+        # scales: subtract ln(sqrt(2)) in-place, then duplicate
+        new_scales_log = scales_log_chosen - scale_offset  # [c, 3]
+
+        # opacities: alpha_new = 1 - sqrt(1 - alpha)
+        o_raw_old = params["opacities"][chosen_inds]
+        alpha_old = torch.sigmoid(o_raw_old)
+        alpha_new = 1.0 - torch.sqrt(1.0 - alpha_old.clamp(max=0.9999999))
+        raw_new = (alpha_new / (1.0 - alpha_new + 1e-24)).log()  # logit
+
+        # quats: just copy from chosen
+        quats_chosen = params["quats"][chosen_inds]
+
         def param_fn(name: str, p: torch.Tensor) -> torch.Tensor:
             p_old = p.clone()
-            N = p_old.shape[0]
             c = chosen_inds.shape[0]
-
             if c == 0:
                 return torch.nn.Parameter(p_old, requires_grad=p.requires_grad)
 
             if name == "means":
-                # shape [N, 3]
-                old_means = p_old[chosen_inds]
-                s_log = params["scales"].data[chosen_inds]
-                s_linear = torch.exp(s_log)
-                rand_delta = torch.randn_like(old_means, device=device) * noise_std * s_linear
-                # In-place update: subtract delta
-                p_old[chosen_inds] = old_means - rand_delta
-                # Append new row = old_means + delta
-                appended = old_means + rand_delta
-                p_new = torch.cat([p_old, appended], dim=0)
+                # Replace chosen with updated_means_h, append mirrored
+                p_old[chosen_inds] = updated_means_h
+                p_new = torch.cat([p_old, appended_means_h], dim=0)
 
             elif name == "scales":
-                # shape [N, 3] in log space
-                old_log_scales = p_old[chosen_inds]
-                # Subtract ln(sqrt(2)) in-place
-                new_log = old_log_scales - scale_offset
-                p_old[chosen_inds] = new_log
-                # Duplicate
-                p_new = torch.cat([p_old, new_log], dim=0)
+                # Replace chosen with new_scales_log, append the same
+                p_old[chosen_inds] = new_scales_log
+                p_new = torch.cat([p_old, new_scales_log], dim=0)
 
             elif name == "opacities":
-                o_raw_old = p_old[chosen_inds]
-                alpha_old = torch.sigmoid(o_raw_old)
-                alpha_new = 1.0 - torch.sqrt(1.0 - alpha_old.clamp(max=0.9999999))
-                raw_new = (alpha_new / (1.0 - alpha_new + 1e-24)).log()
+                # Replace chosen with transformed logit(opacity), append the same
                 p_old[chosen_inds] = raw_new
                 p_new = torch.cat([p_old, raw_new], dim=0)
 
             elif name == "quats":
-                old_quats = p_old[chosen_inds]
-                p_new = torch.cat([p_old, old_quats], dim=0)
+                # Just copy old -> new
+                p_old[chosen_inds] = quats_chosen
+                p_new = torch.cat([p_old, quats_chosen], dim=0)
+
+            elif name == "w":
+                # Recompute log(w) for updated + appended
+                p_old_chosen = p_old[chosen_inds]
+                w_updated = torch.log(updated_w)
+                w_appended = torch.log(appended_w)
+                p_old_chosen = w_updated  # in-place update
+                p_old[chosen_inds] = p_old_chosen
+                p_new = torch.cat([p_old, w_appended], dim=0)
 
             else:
+                # For any other parameter, mimic 'sample_add': in-place + duplicate
                 chosen_chunk = p_old[chosen_inds]
+                p_old[chosen_inds] = chosen_chunk  # (Could adjust if needed)
                 p_new = torch.cat([p_old, chosen_chunk], dim=0)
 
             return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
@@ -308,7 +344,12 @@ class DefaultStrategy(Strategy):
         device = grads.device
 
         is_grad_high = grads > self.grow_grad2d
-        is_small = (torch.exp(params["scales"]).max(dim=-1).values <= self.grow_scale3d * state["scene_scale"])
+        w_inv = 1.0 / torch.exp(params["w"]).unsqueeze(1)
+        scales = torch.exp(params["scales"]) * w_inv * torch.norm(params["means"], dim=1).unsqueeze(1)
+        is_small = (
+                scales.max(dim=-1).values
+                <= self.grow_scale3d * state["scene_scale"]
+        )
         is_dupli = is_grad_high & is_small
         n_dupli = is_dupli.sum().item()
 

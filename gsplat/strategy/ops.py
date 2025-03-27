@@ -8,7 +8,7 @@ from torch import Tensor
 
 from gsplat import quat_scale_to_covar_preci
 from gsplat.relocation import compute_relocation
-from gsplat.utils import normalized_quat_to_rotmat
+from gsplat.utils import normalized_quat_to_rotmat, xyz_to_polar
 
 
 @torch.no_grad()
@@ -123,44 +123,59 @@ def duplicate(
 
 @torch.no_grad()
 def split(
-    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-    optimizers: Dict[str, torch.optim.Optimizer],
-    state: Dict[str, Tensor],
-    mask: Tensor,
-    revised_opacity: bool = False,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Tensor],
+        mask: Tensor,
+        revised_opacity: bool = False,
 ):
-    """Inplace split the Gaussian with the given mask.
+    """Inplace split the Gaussians with the given mask.
 
     Args:
         params: A dictionary of parameters.
         optimizers: A dictionary of optimizers, each corresponding to a parameter.
-        mask: A boolean mask to split the Gaussians.
-        revised_opacity: Whether to use revised opacity formulation
-          from arXiv:2404.06109. Default: False.
+        state: A dictionary of extra running states (Tensors).
+        mask: A boolean mask (True => the Gaussians to be split).
+        revised_opacity: Whether to use the revised opacity formulation
+            from arXiv:2404.06109. Default: False.
     """
     device = mask.device
     sel = torch.where(mask)[0]
     rest = torch.where(~mask)[0]
 
-    scales = torch.exp(params["scales"][sel])
+    w_inv = 1 / torch.exp(params["w"][sel]).unsqueeze(1)
+
+    means = params["means"][sel]
+    scales = (
+            torch.exp(params["scales"][sel])
+            * w_inv
+            * torch.norm(means, dim=1).unsqueeze(1)
+    )
     quats = F.normalize(params["quats"][sel], dim=-1)
-    rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
+    rotmats = normalized_quat_to_rotmat(quats)
+
     samples = torch.einsum(
         "nij,nj,bnj->bni",
         rotmats,
         scales,
         torch.randn(2, len(scales), 3, device=device),
-    )  # [2, N, 3]
+    )
+
+    new_means = (means * w_inv + samples).reshape(-1, 3)
+    _, new_w, _ = xyz_to_polar(new_means)
+    new_means = new_means * new_w.unsqueeze(1)
 
     def param_fn(name: str, p: Tensor) -> Tensor:
         repeats = [2] + [1] * (p.dim() - 1)
         if name == "means":
-            p_split = (p[sel] + samples).reshape(-1, 3)  # [2N, 3]
+            p_split = new_means
         elif name == "scales":
-            p_split = torch.log(scales / 1.6).repeat(2, 1)  # [2N, 3]
+            p_split = torch.log(torch.exp(params["scales"][sel]) / 1.6).repeat(2, 1)
         elif name == "opacities" and revised_opacity:
             new_opacities = 1.0 - torch.sqrt(1.0 - torch.sigmoid(p[sel]))
-            p_split = torch.logit(new_opacities).repeat(repeats)  # [2N]
+            p_split = torch.logit(new_opacities).repeat(repeats)
+        elif name == "w":
+            p_split = torch.log(new_w)
         else:
             p_split = p[sel].repeat(repeats)
         p_new = torch.cat([p[rest], p_split])
@@ -192,7 +207,7 @@ def split_edc(
     """Inplace split the Gaussian with the given mask, adapted to mimic densify_and_split_EDC.
 
     Args:
-        params: A dictionary of parameters (e.g., "means", "scales", "opacities", "quats").
+        params: A dictionary of parameters (e.g., "means", "scales", "opacities", "quats", "w").
         optimizers: A dictionary of optimizers, each corresponding to a parameter.
         state: A dictionary of extra state tensors.
         mask: A boolean mask to select Gaussians for splitting.
@@ -206,38 +221,62 @@ def split_edc(
     if len(sel) == 0:
         return  # No Gaussians to split
 
-    # Compute dominant axis
-    scales_log = params["scales"][sel]  # [N, 3], log-scalings
-    max_indices = torch.argmax(scales_log, dim=1)  # [N]
-    scales = torch.exp(scales_log)  # [N, 3]
-    offset_magnitudes = 1.5 * scales[torch.arange(len(sel)), max_indices]  # [N]
+    # w_inv is used to convert from homogeneous to standard 3D coords.
+    w_inv = 1 / torch.exp(params["w"][sel]).unsqueeze(1)  # [N, 1]
+    means = params["means"][sel]  # [N, 3] in homogeneous representation
+    # Convert scales to real 3D scales for splitting calculations
+    scales_log = params["scales"][sel]  # [N, 3] (log scale)
+    scales_3d = (
+        torch.exp(scales_log) * w_inv * torch.norm(means, dim=1, keepdim=True)
+    )  # [N, 3] in real 3D
 
-    # Deterministic offsets along dominant axis
+    # Compute dominant axis using these real 3D scales
+    max_indices = torch.argmax(scales_3d, dim=1)  # [N]
+    offset_magnitudes = 1.5 * scales_3d[torch.arange(len(sel)), max_indices]  # [N]
+
+    # Prepare offsets in local space, along the dominant axis
     signs = torch.tensor([1.0, -1.0], device=device).view(2, 1)  # [2, 1]
-    offsets_local = torch.zeros(2, len(sel), 3, device=device)
-    offsets_local[torch.arange(2)[:, None], torch.arange(len(sel)), max_indices] = signs * offset_magnitudes
+    offsets_local = torch.zeros(2, len(sel), 3, device=device)  # [2, N, 3]
+    offsets_local[
+        torch.arange(2)[:, None],  # [0,1] in dim 0
+        torch.arange(len(sel)),    # [0..N-1] in dim 1
+        max_indices
+    ] = signs * offset_magnitudes
 
-    # Rotate offsets to world space (assuming normalized_quat_to_rotmat is defined elsewhere)
-    quats = F.normalize(params["quats"][sel], dim=-1)
-    rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
+    # Rotate offsets to world space
+    quats = F.normalize(params["quats"][sel], dim=-1)  # [N, 4]
+    rotmats = normalized_quat_to_rotmat(quats)         # [N, 3, 3]
     offsets_world = torch.einsum("nij,bnj->bni", rotmats, offsets_local)  # [2, N, 3]
-    new_means = (params["means"][sel].unsqueeze(0) + offsets_world).reshape(-1, 3)  # [2N, 3]
 
-    # Adjust scaling
+    # Convert means from homogeneous to 3D, apply offset, then reshape
+    means_3d = means * w_inv  # [N, 3] in standard 3D
+    new_means_3d = (means_3d.unsqueeze(0) + offsets_world).reshape(-1, 3)  # [2N, 3]
+
+    # Get new radial distance (w in polar sense), and re-embed in homogeneous coords
+    _, new_w, _ = xyz_to_polar(new_means_3d)  # new_w: [2N]
+    new_means = new_means_3d * new_w.unsqueeze(1)  # re-embed: [2N, 3]
+
+    # Adjust scaling log-values: shrink on dominant axis, mild shrink on others
     log_0_5 = math.log(0.5)
     log_0_85 = math.log(0.85)
     adj = torch.full((len(sel), 3), log_0_85, device=device)
     adj[torch.arange(len(sel)), max_indices] = log_0_5
-    new_scales = scales_log + adj  # [N, 3]
-    new_scales = new_scales.repeat(2, 1)  # [2N, 3]
+    new_scales_log = (scales_log + adj).repeat(2, 1)  # [2N, 3]
 
     def param_fn(name: str, p: Tensor) -> Tensor:
         """Update parameter tensors with split values."""
         repeats = [2] + [1] * (p.dim() - 1)
         if name == "means":
-            p_split = new_means  # [2N, 3]
+            # Use the newly computed homogeneous means
+            p_split = new_means
         elif name == "scales":
-            p_split = new_scales  # [2N, 3]
+            # Use the newly computed log scales
+            p_split = new_scales_log
+        elif name == "w":
+            # w is log of the radial distance
+            p_split = torch.log(new_w)  # [2N]
+            if p.dim() > 1:  # if shape is [N, 1], repeat accordingly
+                p_split = p_split.unsqueeze(1)
         elif name == "opacities":
             opacity = torch.sigmoid(p[sel])
             if revised_opacity:
@@ -246,11 +285,13 @@ def split_edc(
                 new_opacity = 0.6 * opacity
             p_split_logit = torch.logit(new_opacity)
             if p.dim() == 1:
-                p_split = p_split_logit.repeat(2)  # [2N]
+                p_split = p_split_logit.repeat(2)
             else:
-                p_split = p_split_logit.repeat(2, 1)  # [2N, 1]
+                p_split = p_split_logit.repeat(2, 1)
         else:
-            p_split = p[sel].repeat(repeats)  # Adapts to p's dimensions
+            # Default: just repeat the original
+            p_split = p[sel].repeat(repeats)
+
         p_new = torch.cat([p[rest], p_split], dim=0)
         p_new = torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
         return p_new
@@ -260,7 +301,7 @@ def split_edc(
         v_split = torch.zeros((2 * len(sel), *v.shape[1:]), device=device)
         return torch.cat([v[rest], v_split], dim=0)
 
-    # Update parameters and optimizers (assuming _update_param_with_optimizer is defined)
+    # Update parameters and optimizers
     _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
 
     # Update state
@@ -269,6 +310,7 @@ def split_edc(
             repeats = [2] + [1] * (v.dim() - 1)
             v_new = v[sel].repeat(repeats)
             state[k] = torch.cat((v[rest], v_new), dim=0)
+
 
 @torch.no_grad()
 def remove(
@@ -475,11 +517,18 @@ def inject_noise_to_position_new(
     :param scaler: Base scaling factor for noise.
     """
     # 1) Compute alpha and convert to weighting = (1 - alpha)^100
-    opacities = torch.sigmoid(params["opacities"].flatten())
+    opacities = torch.sigmoid(params["opacities"].flatten())  # shape [N]
     alpha_weight = (1.0 - opacities).pow(100)
+    w_inv = 1 / torch.exp(params["w"]).unsqueeze(1)
+
+    means = params["means"]
+    scales = (
+            torch.exp(params["scales"])
+            * w_inv
+            * torch.norm(means, dim=1).unsqueeze(1)
+    )
 
     # 2) Compute local covariance for each Gaussian (orientation & scale)
-    scales = torch.exp(params["scales"])
     covars, _ = quat_scale_to_covar_preci(
         params["quats"],
         scales,
@@ -498,6 +547,11 @@ def inject_noise_to_position_new(
     # 4) Transform noise by the covariance so it respects each Gaussian's orientation
     #    covars is shape [N,3,3], noise is [N,3]
     noise = torch.einsum("bij,bj->bi", covars, noise)
+    cart_new = means * w_inv + noise
 
-    # 5) In-place add to the means
-    params["means"].add_(noise)
+    _, r_new, _ = xyz_to_polar(cart_new)
+    means_new = cart_new * r_new.unsqueeze(1)
+
+    # Store
+    params["means"].data = means_new
+    params["w"].data = torch.log(r_new.clamp_min(1e-8))

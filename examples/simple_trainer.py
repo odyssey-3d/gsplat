@@ -15,13 +15,9 @@ import tqdm
 import tyro
 import viser
 import yaml
+from gsplat.utils import xyz_to_polar
 from pathlib import Path
 from datasets.colmap import Dataset, Parser
-from datasets.traj import (
-    generate_interpolated_path,
-    generate_ellipse_path_z,
-    generate_spiral_path,
-)
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -366,18 +362,18 @@ def create_splats_with_optimizers(
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
-    elif init_type == "random":
-        points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
-        rgbs = torch.rand((init_num_pts, 3))
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
 
+    _, w, r = xyz_to_polar(points)
+    points *=  w.unsqueeze(1)
+    w = torch.log(w)
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+    dist2_avg = (knn(torch.from_numpy(parser.points).float(), 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+    scales = torch.log(torch.sqrt(dist2_avg) * init_scale / r).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
     # Distribute the GSs to different ranks (also works for single rank)
+    w = w[world_rank::world_size]
     points = points[world_rank::world_size]
     rgbs = rgbs[world_rank::world_size]
     scales = scales[world_rank::world_size]
@@ -389,6 +385,7 @@ def create_splats_with_optimizers(
     params = [
         # name, value, lr
         ("means", torch.nn.Parameter(points), 5e-5 * scene_scale),
+        ("w", torch.nn.Parameter(w), 5e-5 * scene_scale),
         ("scales", torch.nn.Parameter(scales), 8e-3),
         ("quats", torch.nn.Parameter(quats), 1e-3),
         ("opacities", torch.nn.Parameter(opacities), 3e-2),
@@ -611,11 +608,10 @@ class Runner:
         masks: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
-        means = self.splats["means"]  # [N, 3]
-        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
-        # rasterization does normalization internally
+        w_inv = 1.0 / torch.exp(self.splats["w"]).unsqueeze(1)
+        means = self.splats["means"] * w_inv  # [N, 3]
         quats = self.splats["quats"]  # [N, 4]
-        scales = torch.exp(self.splats["scales"])  # [N, 3]
+        scales = torch.exp(self.splats["scales"]) * w_inv * torch.norm(self.splats["means"], dim=1).unsqueeze(1)
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
@@ -657,6 +653,7 @@ class Runner:
             )
         except Exception as e:
             print(e)
+            raise
         if masks is not None:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
@@ -679,6 +676,9 @@ class Runner:
             # means has a learning rate schedule, that end at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(
                 self.optimizers["means"], gamma=0.008 ** (1.0 / max_steps)
+            ),
+            torch.optim.lr_scheduler.ExponentialLR(
+                self.optimizers["w"], gamma=0.004 ** (1.0 / max_steps)
             ),
             torch.optim.lr_scheduler.ExponentialLR(
                 self.optimizers["scales"], gamma=0.375 ** (1.0 / max_steps)
@@ -765,18 +765,22 @@ class Runner:
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
             # forward
-            renders, alphas, info = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=sh_degree_to_use,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
-                masks=masks,
-            )
+            try:
+                renders, alphas, info = self.rasterize_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    sh_degree=sh_degree_to_use,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    image_ids=image_ids,
+                    render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                    masks=masks,
+                )
+            except Exception as e:
+                print(e)
+
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
