@@ -194,11 +194,6 @@ def save_ply(
     *in world space*, applying `scene_scale` if requested.
     Opacities are also sigmoid'ed to store the final alpha.
     """
-    print(f"Saving ply to {path}")
-    print(splats["scales"][0:10, :])
-    print("w")
-    print(splats["w"][0:10])
-
     # Convert all tensors to numpy arrays
     numpy_data = {k: v.detach().cpu().numpy() for k, v in splats.items()}
 
@@ -211,7 +206,6 @@ def save_ply(
     # Check if we have 'w' (log of W) in the dictionary
     has_w = "w" in numpy_data
     if has_w:
-        print("has w")
         w_log = numpy_data["w"]              # (N,)
         w = np.exp(w_log).reshape(-1, 1)     # W in linear space
         # Convert homogeneous means -> 3D means in world space
@@ -227,7 +221,6 @@ def save_ply(
     # training-time logic. If 'w' is present, we do the same as the rasterizer:
     #    scale_3d = exp(scales_log) * (1 / w) * norm(M)
     if has_w:
-        print("has w")
         norms_means = np.linalg.norm(means, axis=1, keepdims=True)  # (N, 1)
         w = np.exp(w_log).reshape(-1, 1)     # W in linear space
         scales_3d = np.exp(scales_log) / w * norms_means
