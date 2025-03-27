@@ -77,7 +77,7 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 30_000
+    max_steps: int = 50_000
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [30_000])
     # Steps to save the model
@@ -187,21 +187,33 @@ def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = No
     # Convert all tensors to numpy arrays
     numpy_data = {k: v.detach().cpu().numpy() for k, v in splats.items()}
 
-    # Extract data arrays
-    means = numpy_data["means"]
-    scales = numpy_data["scales"]
-    quats = numpy_data["quats"]
-    opacities = numpy_data["opacities"]
+    # Required keys
+    means = numpy_data["means"]              # (N, 3), stored in homogeneous form
+    scales_log = numpy_data["scales"]        # (N, 3), stored in log space
+    quats = numpy_data["quats"]             # (N, 4)
+    opacities_logit = numpy_data["opacities"]  # (N,) or (N,1), logit of alpha
 
-    # Remove outliers based on position
-    mean_pos = np.mean(means, axis=0)
-    distances = np.linalg.norm(means - mean_pos, axis=1)
+    w_log = numpy_data["w"]             # (N,)
+    w = np.exp(w_log).reshape(-1, 1)    # convert log(w) -> w
+    # Convert homogeneous means -> 3D means
+    means_3d = means / w
+
+    # Convert logit(opacities) -> alpha
+    opacities = 1.0 / (1.0 + np.exp(-opacities_logit))  # shape (N,)
+
+    norms_means = np.linalg.norm(means, axis=1, keepdims=True)  # (N,1)
+    w_inv = 1.0 / w
+    scales_3d = np.exp(scales_log) * w_inv * norms_means  # (N,3) in real 3D
+
+    # -- Remove outliers based on 3D position --
+    mean_pos = np.mean(means_3d, axis=0)
+    distances = np.linalg.norm(means_3d - mean_pos, axis=1)
     std_dist = np.std(distances)
     inliers = distances <= 6 * std_dist  # Points within 6 standard deviations
 
-    # Filter all data arrays
-    means = means[inliers]
-    scales = scales[inliers]
+    # Filter all data arrays by inliers
+    means_3d = means_3d[inliers]
+    scales_3d = scales_3d[inliers]
     quats = quats[inliers]
     opacities = opacities[inliers]
 
@@ -214,8 +226,8 @@ def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = No
 
     # Initialize ply_data
     ply_data = {
-        "positions": o3d.core.Tensor(means, dtype=o3d.core.Dtype.Float32),
-        "normals": o3d.core.Tensor(np.zeros_like(means), dtype=o3d.core.Dtype.Float32),
+        "positions": o3d.core.Tensor(means_3d, dtype=o3d.core.Dtype.Float32),
+        "normals": o3d.core.Tensor(np.zeros_like(means_3d), dtype=o3d.core.Dtype.Float32),
     }
 
     # Add features
@@ -243,9 +255,9 @@ def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = No
     )
 
     # Add scales
-    for i in range(scales.shape[1]):
+    for i in range(scales_3d.shape[1]):
         ply_data[f"scale_{i}"] = o3d.core.Tensor(
-            scales[:, i : i + 1], dtype=o3d.core.Dtype.Float32
+            scales_3d[:, i : i + 1], dtype=o3d.core.Dtype.Float32
         )
 
     # Add rotations
@@ -258,6 +270,7 @@ def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = No
     pcd = o3d.t.geometry.PointCloud(ply_data)
     success = o3d.t.io.write_point_cloud(dir, pcd)
     assert success, "Could not save ply file."
+
 
 def merge_checkpoints(ckpts_folder: str, output_dir: str = None):
     """
@@ -345,8 +358,6 @@ def save_step_images(pixels, image_mask, save_dir, step):
 def create_splats_with_optimizers(
     parser: Parser,
     init_type: str = "sfm",
-    init_num_pts: int = 100_000,
-    init_extent: float = 3.0,
     init_opacity: float = 0.1,
     init_scale: float = 1.0,
     scene_scale: float = 1.0,
@@ -384,11 +395,11 @@ def create_splats_with_optimizers(
 
     params = [
         # name, value, lr
-        ("means", torch.nn.Parameter(points), 5e-5 * scene_scale),
-        ("w", torch.nn.Parameter(w), 5e-5 * scene_scale),
-        ("scales", torch.nn.Parameter(scales), 8e-3),
+        ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
+        ("w", torch.nn.Parameter(w), 0.0002 * scene_scale),
+        ("scales", torch.nn.Parameter(scales), 5e-3),
         ("quats", torch.nn.Parameter(quats), 1e-3),
-        ("opacities", torch.nn.Parameter(opacities), 3e-2),
+        ("opacities", torch.nn.Parameter(opacities), 5e-2),
     ]
 
     if feature_dim is None:
@@ -479,8 +490,6 @@ class Runner:
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
-            init_num_pts=cfg.init_num_pts,
-            init_extent=cfg.init_extent,
             init_opacity=cfg.init_opa,
             init_scale=cfg.init_scale,
             scene_scale=self.scene_scale,
@@ -675,10 +684,10 @@ class Runner:
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["means"], gamma=0.008 ** (1.0 / max_steps)
+                self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
             ),
             torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["w"], gamma=0.004 ** (1.0 / max_steps)
+                self.optimizers["w"], gamma=0.005 ** (1.0 / max_steps)
             ),
             torch.optim.lr_scheduler.ExponentialLR(
                 self.optimizers["scales"], gamma=0.375 ** (1.0 / max_steps)

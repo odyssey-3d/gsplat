@@ -37,10 +37,10 @@ class DefaultStrategy(Strategy):
     prune_scale3d: float = 0.1
     prune_scale2d: float = 0.15
     refine_scale2d_stop_iter: int = 0
-    refine_start_iter: int = 500
-    refine_stop_iter: int = 25_000
+    refine_start_iter: int = 1_500
+    refine_stop_iter: int = 45_000
     reset_every: int = 3000
-    refine_every: int = 100
+    refine_every: int = 200
     pause_refine_after_reset: int = 0
     absgrad: bool = False
     revised_opacity: bool = True
