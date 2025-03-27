@@ -187,33 +187,22 @@ def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = No
     # Convert all tensors to numpy arrays
     numpy_data = {k: v.detach().cpu().numpy() for k, v in splats.items()}
 
-    # Required keys
-    means = numpy_data["means"]              # (N, 3), stored in homogeneous form
-    scales_log = numpy_data["scales"]        # (N, 3), stored in log space
-    quats = numpy_data["quats"]             # (N, 4)
-    opacities_logit = numpy_data["opacities"]  # (N,) or (N,1), logit of alpha
+    # Extract data arrays
+    w_inv = 1.0 / torch.exp(splats["w"]).unsqueeze(1)
+    means = splats["means"] * w_inv  # [N, 3]
+    quats = splats["quats"]  # [N, 4]
+    scales = torch.exp(splats["scales"]) * w_inv * torch.norm(splats["means"], dim=1).unsqueeze(1)
+    opacities = torch.sigmoid(splats["opacities"])  # [N,]
 
-    w_log = numpy_data["w"]             # (N,)
-    w = np.exp(w_log).reshape(-1, 1)    # convert log(w) -> w
-    # Convert homogeneous means -> 3D means
-    means_3d = means / w
-
-    # Convert logit(opacities) -> alpha
-    opacities = 1.0 / (1.0 + np.exp(-opacities_logit))  # shape (N,)
-
-    norms_means = np.linalg.norm(means, axis=1, keepdims=True)  # (N,1)
-    w_inv = 1.0 / w
-    scales_3d = np.exp(scales_log) * w_inv * norms_means  # (N,3) in real 3D
-
-    # -- Remove outliers based on 3D position --
-    mean_pos = np.mean(means_3d, axis=0)
-    distances = np.linalg.norm(means_3d - mean_pos, axis=1)
+    # Remove outliers based on position
+    mean_pos = np.mean(means, axis=0)
+    distances = np.linalg.norm(means - mean_pos, axis=1)
     std_dist = np.std(distances)
     inliers = distances <= 6 * std_dist  # Points within 6 standard deviations
 
-    # Filter all data arrays by inliers
-    means_3d = means_3d[inliers]
-    scales_3d = scales_3d[inliers]
+    # Filter all data arrays
+    means = means[inliers]
+    scales = scales[inliers]
     quats = quats[inliers]
     opacities = opacities[inliers]
 
@@ -226,8 +215,8 @@ def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = No
 
     # Initialize ply_data
     ply_data = {
-        "positions": o3d.core.Tensor(means_3d, dtype=o3d.core.Dtype.Float32),
-        "normals": o3d.core.Tensor(np.zeros_like(means_3d), dtype=o3d.core.Dtype.Float32),
+        "positions": o3d.core.Tensor(means, dtype=o3d.core.Dtype.Float32),
+        "normals": o3d.core.Tensor(np.zeros_like(means), dtype=o3d.core.Dtype.Float32),
     }
 
     # Add features
@@ -255,9 +244,9 @@ def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = No
     )
 
     # Add scales
-    for i in range(scales_3d.shape[1]):
+    for i in range(scales.shape[1]):
         ply_data[f"scale_{i}"] = o3d.core.Tensor(
-            scales_3d[:, i : i + 1], dtype=o3d.core.Dtype.Float32
+            scales[:, i : i + 1], dtype=o3d.core.Dtype.Float32
         )
 
     # Add rotations
