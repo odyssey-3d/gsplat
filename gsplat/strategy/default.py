@@ -32,7 +32,7 @@ class DefaultStrategy(Strategy):
     min_opacity: float = 0.005
     grow_scale3d: float = 0.01
     grow_scale2d: float = 0.05
-    max_count: int = 5_000_000
+    max_count: int = 10_000_000
     noise_lr: float = 5e4
     prune_scale3d: float = 0.1
     prune_scale2d: float = 0.15
