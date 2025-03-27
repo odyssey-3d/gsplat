@@ -104,7 +104,7 @@ class DefaultStrategy(Strategy):
 
         # Possibly refine
         if (step >= self.refine_start_iter) and (step < self.refine_stop_iter) and (step % self.refine_every == 0):
-            n_prune = self._prune_gs(params, optimizers, state)
+            n_prune = self._prune_gs(params, optimizers, state, step)
             n_added = 0
             if n_prune > 0:
                 n_added_prune = self._replace_pruned(params, optimizers, state, n_prune)
@@ -178,10 +178,25 @@ class DefaultStrategy(Strategy):
         params: Dict[str, torch.nn.Parameter],
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
+        step
     ) -> int:
         alpha = torch.sigmoid(params["opacities"])
         is_prune = alpha < self.prune_opa
         n_prune = is_prune.sum().item()
+
+        if step > self.reset_every:
+            w_inv = 1.0 / torch.exp(params["w"]).unsqueeze(1)
+            scales = torch.exp(params["scales"]) * w_inv * torch.norm(params["means"], dim=1).unsqueeze(1)
+            is_too_big = (
+                    scales.max(dim=-1).values
+                    > self.prune_scale3d * state["scene_scale"]
+            )
+
+            if step < self.refine_scale2d_stop_iter:
+                is_too_big |= state["radii"] > self.prune_scale2d
+
+            is_prune = is_prune | is_too_big
+
         if n_prune > 0:
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
         return n_prune
