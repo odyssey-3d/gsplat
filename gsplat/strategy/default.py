@@ -184,19 +184,6 @@ class DefaultStrategy(Strategy):
         is_prune = alpha < self.prune_opa
         n_prune = is_prune.sum().item()
 
-        if step > self.reset_every:
-            w_inv = 1.0 / torch.exp(params["w"]).unsqueeze(1)
-            scales = torch.exp(params["scales"]) * w_inv * torch.norm(params["means"], dim=1).unsqueeze(1)
-            is_too_big = (
-                    scales.max(dim=-1).values
-                    > self.prune_scale3d * state["scene_scale"]
-            )
-
-            if step < self.refine_scale2d_stop_iter:
-                is_too_big |= state["radii"] > self.prune_scale2d
-
-            is_prune = is_prune | is_too_big
-
         if n_prune > 0:
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
         return n_prune
