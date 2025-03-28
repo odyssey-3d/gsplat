@@ -51,7 +51,6 @@ def rasterization(
         distributed: bool = False,
         camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
         covars: Optional[Tensor] = None,
-        collect_weights: bool = False,
         weights: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
@@ -572,7 +571,6 @@ def rasterization(
             backgrounds=backgrounds,
             packed=packed,
             absgrad=absgrad,
-            collect_weights=collect_weights,
             weights=weights,
         )
     if render_mode in ["ED", "RGB+ED"]:
