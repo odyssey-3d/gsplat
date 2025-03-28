@@ -38,6 +38,7 @@ from gsplat.distributed import cli
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat.optimizers import SelectiveAdam
+import traceback
 
 
 @dataclass
@@ -664,6 +665,7 @@ class Runner:
             )
         except Exception as e:
             print(e)
+            traceback.print_exc()
             raise
         if masks is not None:
             render_colors[~masks] = 0
@@ -743,6 +745,7 @@ class Runner:
             try:
                 data = next(trainloader_iter)
             except StopIteration:
+                traceback.print_exc()
                 trainloader_iter = iter(trainloader)
                 data = next(trainloader_iter)
 
@@ -790,6 +793,7 @@ class Runner:
                     masks=masks,
                 )
             except Exception as e:
+                traceback.print_exc()
                 print(e)
 
             if renders.shape[-1] == 4:
@@ -1159,8 +1163,9 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
                 runner.run_compression(step=step)
         else:
             runner.train()
-    except:
-        print("Dataloader not terminated properly")
+    except Exception as e:
+        print(e)
+        traceback.print_exc()
 
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()

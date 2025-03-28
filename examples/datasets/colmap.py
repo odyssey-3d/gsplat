@@ -408,17 +408,17 @@ class Dataset(torch.utils.data.Dataset):
     def get_downsample_factor(self) -> int:
         """Determine downsample factor based on current iteration."""
         current_iter = self._current_iter.value
-        if current_iter < 500:
-            return 1
-        elif current_iter < 1000:
-            return 4
-        elif current_iter < 1500:
-            return 2
-        elif current_iter < 2000:
-            return 1
-        elif current_iter < 2500:
-            return 4
-        return 1
+        #if current_iter < 500:
+        #    return 1
+        #elif current_iter < 1000:
+        #    return 4
+        #elif current_iter < 1500:
+        #    return 2
+        #elif current_iter < 2000:
+        #    return 1
+        #elif current_iter < 2500:
+        #    return 4
+        return 4
 
     def get_neighboring_indices(self, base_idx: int, N: int) -> List[int]:
         """Return indices of N nearest cameras based on Euclidean distance."""
