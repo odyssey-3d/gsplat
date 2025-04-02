@@ -32,23 +32,23 @@ def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = No
         scales_3d = np.exp(scales_log)
 
     # Remove outliers based on position
-    mean_pos = np.mean(means_3d, axis=0)
-    distances = np.linalg.norm(means_3d - mean_pos, axis=1)
-    std_dist = np.std(distances)
-    inliers = distances <= 6 * std_dist  # Points within 6 standard deviations
+    #mean_pos = np.mean(means_3d, axis=0)
+    #distances = np.linalg.norm(means_3d - mean_pos, axis=1)
+    #std_dist = np.std(distances)
+    #inliers = distances <= 6 * std_dist  # Points within 6 standard deviations
 
     # Filter all data arrays
-    means = means_3d[inliers]
-    scales = scales_3d[inliers]
-    quats = quats[inliers]
-    opacities = opacities[inliers]
+    means = means_3d
+    scales = scales_3d
+    quats = quats
+    opacities = opacities
 
     # Handle colors or spherical harmonics based on whether colors is provided
     if colors is not None:
-        colors = colors.detach().cpu().numpy()[inliers]
+        colors = colors.detach().cpu().numpy()
     else:
-        sh0 = numpy_data["sh0"][inliers].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
-        shN = numpy_data["shN"][inliers].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
+        sh0 = numpy_data["sh0"].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
+        shN = numpy_data["shN"].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
 
     # Initialize ply_data with positions and normals
     ply_data = {

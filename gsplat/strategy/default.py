@@ -27,12 +27,12 @@ class DefaultStrategy(Strategy):
 
     prune_opa: float = 0.005
     grow_grad2d: float = 0.00008
-    growth_stop_iter: int = 35_000
+    growth_stop_iter: int = 55_000
 
     min_opacity: float = 0.005
     grow_scale3d: float = 0.01
     grow_scale2d: float = 0.05
-    max_count: int = 20_000_000
+    max_count: int = 10_000_000
     noise_lr: float = 5e4
     prune_scale3d: float = 0.1
     prune_scale2d: float = 0.15
@@ -90,9 +90,6 @@ class DefaultStrategy(Strategy):
         self.binoms = self.binoms.to(params["means"].device)
         self._update_state(params, state, info, packed=packed)
 
-        # ----------------------------------------------------------------------------
-        # CHANGED: Use (1 - alpha)^100 weighting for noise injection
-        # ----------------------------------------------------------------------------
         if step < self.refine_stop_iter:
             inject_noise_to_position_new(
                 params=params,
@@ -100,8 +97,6 @@ class DefaultStrategy(Strategy):
                 state=state,
                 scaler=lr * self.noise_lr,
             )
-        # ----------------------------------------------------------------------------
-
         # Possibly refine
         if (step >= self.refine_start_iter) and (step < self.refine_stop_iter) and (step % self.refine_every == 0):
             n_prune = self._prune_gs(params, optimizers, state, step)
@@ -126,6 +121,8 @@ class DefaultStrategy(Strategy):
             state["count"].zero_()
             if state["radii"] is not None:
                 state["radii"].zero_()
+
+            torch.cuda.empty_cache()
 
     def _update_state(
         self,

@@ -53,7 +53,7 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "/home/paja/data/whz"
+    data_dir: str = "/home/paja/data/fasnacht"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
@@ -82,7 +82,7 @@ class Config:
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [30_000])
+    save_steps: List[int] = field(default_factory=lambda: [30_000, 40_000, 50_000])
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -117,7 +117,7 @@ class Config:
     # Use visible adam from Taming 3DGS. (experimental)
     visible_adam: bool = False
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
-    antialiased: bool = False
+    antialiased: bool = True
 
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
@@ -125,7 +125,7 @@ class Config:
     # Opacity regularization
     opacity_reg: float = 0.01
     # Scale regularization
-    scale_reg: float = 0.001
+    scale_reg: float = 0.005
 
     # Enable camera optimization.
     pose_opt: bool = False
@@ -208,23 +208,23 @@ def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = No
         scales_3d = np.exp(scales_log)
 
     # Remove outliers based on position
-    mean_pos = np.mean(means_3d, axis=0)
-    distances = np.linalg.norm(means_3d - mean_pos, axis=1)
-    std_dist = np.std(distances)
-    inliers = distances <= 6 * std_dist  # Points within 6 standard deviations
+    #mean_pos = np.mean(means_3d, axis=0)
+    #distances = np.linalg.norm(means_3d - mean_pos, axis=1)
+    #std_dist = np.std(distances)
+    #inliers = distances <= 6 * std_dist  # Points within 6 standard deviations
 
     # Filter all data arrays
-    means = means_3d[inliers]
-    scales = scales_3d[inliers]
-    quats = quats[inliers]
-    opacities = opacities[inliers]
+    means = means_3d
+    scales = scales_3d
+    quats = quats
+    opacities = opacities
 
     # Handle colors or spherical harmonics based on whether colors is provided
     if colors is not None:
-        colors = colors.detach().cpu().numpy()[inliers]
+        colors = colors.detach().cpu().numpy()
     else:
-        sh0 = numpy_data["sh0"][inliers].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
-        shN = numpy_data["shN"][inliers].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
+        sh0 = numpy_data["sh0"].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
+        shN = numpy_data["shN"].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
 
     # Initialize ply_data with positions and normals
     ply_data = {
@@ -379,12 +379,12 @@ def create_splats_with_optimizers(
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
 
-    _, w, r = xyz_to_polar(points)
-    points *=  w.unsqueeze(1)
+    _, w, _ = xyz_to_polar(points)
+    points *= w.unsqueeze(1)
     w = torch.log(w)
-    # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(torch.from_numpy(parser.points).float(), 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    scales = torch.log(torch.sqrt(dist2_avg) * init_scale / r).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+
+    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+    scales = torch.log(torch.sqrt(dist2_avg) * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
     # Distribute the GSs to different ranks (also works for single rank)
     w = w[world_rank::world_size]
@@ -474,6 +474,7 @@ class Runner:
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
             data_dir=cfg.data_dir,
+            total_iterations=cfg.max_steps,
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
@@ -870,6 +871,10 @@ class Runner:
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            num_gs = len(self.splats["means"])
+            desc += f"GS={num_gs}| "
+            downsample_factor = data["downsample_factor"]
+            desc += f"Factor={downsample_factor.item():.2f}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
