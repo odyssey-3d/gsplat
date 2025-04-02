@@ -27,7 +27,7 @@ class DefaultStrategy(Strategy):
 
     prune_opa: float = 0.005
     grow_grad2d: float = 0.00008
-    growth_stop_iter: int = 55_000
+    growth_stop_iter: int = 45_000
 
     min_opacity: float = 0.005
     grow_scale3d: float = 0.01
