@@ -294,8 +294,6 @@ def main():
         pin_memory=True,
         persistent_workers=True
     )
-    trainloader_iter = iter(trainloader)
-
     # --------------------------------------------------
     # 2) Load your Gaussians from PLY
     # --------------------------------------------------
