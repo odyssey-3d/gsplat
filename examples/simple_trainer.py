@@ -2,6 +2,7 @@ import json
 import math
 import os
 import time
+import traceback
 from dataclasses import dataclass, field
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
@@ -658,6 +659,8 @@ class Runner:
             )
         except Exception as e:
             print(e)
+            traceback.print_exc()
+            raise
         if masks is not None:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
@@ -761,18 +764,24 @@ class Runner:
                 sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
                 # forward
-                renders, alphas, info = self.rasterize_splats(
-                    camtoworlds=camtoworlds,
-                    Ks=Ks,
-                    width=width,
-                    height=height,
-                    sh_degree=sh_degree_to_use,
-                    near_plane=cfg.near_plane,
-                    far_plane=cfg.far_plane,
-                    image_ids=image_ids,
-                    render_mode="RGB+ED" if cfg.depth_loss else "RGB",
-                    masks=masks,
-                )
+                try:
+                    renders, alphas, info = self.rasterize_splats(
+                        camtoworlds=camtoworlds,
+                        Ks=Ks,
+                        width=width,
+                        height=height,
+                        sh_degree=sh_degree_to_use,
+                        near_plane=cfg.near_plane,
+                        far_plane=cfg.far_plane,
+                        image_ids=image_ids,
+                        render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                        masks=masks,
+                    )
+                except Exception as e:
+                    traceback.print_exc()
+                    print(e)
+                    raise
+
                 if renders.shape[-1] == 4:
                     colors, depths = renders[..., 0:3], renders[..., 3:4]
                 else:
@@ -1110,14 +1119,20 @@ class Runner:
         c2w = torch.from_numpy(c2w).float().to(self.device)
         K = torch.from_numpy(K).float().to(self.device)
 
-        render_colors, _, _ = self.rasterize_splats(
-            camtoworlds=c2w[None],
-            Ks=K[None],
-            width=W,
-            height=H,
-            sh_degree=self.cfg.sh_degree,  # active all SH degrees
-            radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
-        )  # [1, H, W, 3]
+
+        try:
+            render_colors, _, _ = self.rasterize_splats(
+                camtoworlds=c2w[None],
+                Ks=K[None],
+                width=W,
+                height=H,
+                sh_degree=self.cfg.sh_degree,  # active all SH degrees
+                radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
+            )  # [1, H, W, 3]
+        except Exception as e:
+            traceback.print_exc()
+            print(e)
+            render_colors = torch.zeros((1, H, W, 3), dtype=torch.float32, device=self.device)
         return render_colors[0].cpu().numpy()
 
 
