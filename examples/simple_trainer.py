@@ -856,6 +856,10 @@ class Runner:
                 loss.backward()
 
                 desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+                num_gs = len(self.splats["means"])
+                desc += f"GS={num_gs}| "
+                downsample_factor = data["downsample_factor"]
+                desc += f"Factor={downsample_factor.item():.2f}| "
                 if cfg.depth_loss:
                     desc += f"depth loss={depthloss.item():.6f}| "
                 if cfg.pose_opt and cfg.pose_noise:
