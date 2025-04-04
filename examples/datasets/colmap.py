@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from typing_extensions import assert_never
 import torch.nn.functional as F
 import torchvision.transforms as transforms
+import torch.distributed as dist
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import open3d as o3d
 
@@ -280,11 +281,13 @@ class Parser:
     def __init__(
         self,
         data_dir: str,
-        lidar_data_path: str = None,
+        lidar_data_path: Optional[str] = None,
         total_iterations: int = 30_000,
         factor: int = 1,
         normalize: bool = False,
         test_every: int = 8,
+        world_rank: int = 0,
+        world_size: int = 1,
     ):
         self.data_dir = data_dir
         self.factor = factor
@@ -476,7 +479,7 @@ class Parser:
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
 
-        if lidar_data is not None:
+        if lidar_data_path is not None:
             colmap_points = self.points  # (N, 3)
             colmap_colors = self.points_rgb  # (N, 3)
 
@@ -594,9 +597,51 @@ class Parser:
         dists = np.linalg.norm(self.points - scene_center, axis=1)
         self.scene_scale = np.sum(dists, axis=0) / self.points.shape[0]
 
-        XF_full, down_list = compute_dataset_freq_metrics(self.image_paths)
+        self.schedule = None
+        if world_size > 1 and dist.is_initialized():
+            # If in distributed mode and the process group is initialized, let's do it once.
+            if world_rank == 0:
+                # Rank 0 does the expensive analysis
+                XF_full, down_list = compute_dataset_freq_metrics(self.image_paths)
+            else:
+                # Other ranks skip and will receive the results via broadcast
+                XF_full, down_list = 0.0, []
+
+            # Now broadcast the results to all ranks
+            # 1) We have one float (XF_full) and one list of (factor, energy)
+            #    We'll first broadcast how many pairs are in down_list, then the data.
+
+            # Send/receive XF_full
+            xf_tensor = torch.tensor([XF_full], dtype=torch.float32, device="cuda")
+            dist.broadcast(xf_tensor, src=0)
+            XF_full = xf_tensor.item()
+
+            # Convert down_list to a Nx2 tensor
+            if world_rank == 0:
+                arr = np.array(down_list, dtype=np.float32)  # shape [N, 2]
+            else:
+                arr = np.zeros((0, 2), dtype=np.float32)
+
+            arr_shape = torch.tensor(arr.shape, dtype=torch.int64, device="cuda")
+            dist.broadcast(arr_shape, src=0)
+
+            if world_rank != 0:
+                arr = np.zeros((arr_shape[0].item(), arr_shape[1].item()), dtype=np.float32)
+
+            tensor_data = torch.from_numpy(arr).to("cuda")
+            dist.broadcast(tensor_data, src=0)
+            arr = tensor_data.cpu().numpy()
+
+            # Reconstruct down_list
+            down_list = [(float(r[0]), float(r[1])) for r in arr]
+
+        else:
+            # Single GPU or no distributed group:
+            XF_full, down_list = compute_dataset_freq_metrics(self.image_paths)
+
+        # Now everyone has XF_full and down_list, so we can build the schedule:
         self.schedule = allocate_iterations_by_frequency(total_iterations, XF_full, down_list)
-        print(f"Generated Resolution Schedule (factor, steps): {self.schedule}")
+        print(f"[Rank {world_rank}] Generated Resolution Schedule (factor, steps): {self.schedule}")
         if sum(s for f, s in self.schedule) != total_iterations:
             print(f"Warning: Schedule steps sum to {sum(s for f, s in self.schedule)}, expected {total_iterations}. Check allocation logic.")
 

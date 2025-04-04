@@ -53,7 +53,7 @@ class Config:
     # Path to dataset
     data_dir: str = "/media/paja/T7/test_lidar_scene/colmap"
     # Path to lidar data
-    lidar_data_path: str = None
+    lidar_data_path: Optional[str] = None
 
     # Downsample factor for the dataset
     data_factor: int = 1
@@ -465,6 +465,8 @@ class Runner:
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
+            world_rank=world_rank,
+            world_size=world_size,
         )
         self.trainset = Dataset(
             self.parser,
