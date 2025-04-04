@@ -1,11 +1,13 @@
 import os
 import json
+import laspy
 from tqdm import tqdm
 from typing import Any, Dict, List, Optional, Tuple
 from typing_extensions import assert_never
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import open3d as o3d
 
 import imageio.plugins.pyav
 from PIL import Image
@@ -15,6 +17,7 @@ import logging
 import numpy as np
 import torch
 from pycolmap import SceneManager
+from scipy.spatial import cKDTree
 
 from .normalize import (
     align_principle_axes,
@@ -121,12 +124,6 @@ def compute_dataset_freq_metrics(
     # Factor-wise sums/counters
     factor_sums = {r: 0.0 for r in candidate_factors}
     factor_counts = {r: 0 for r in candidate_factors}
-
-    # We'll process images in parallel
-    # Decide if you want threads or processes:
-    #   - ThreadPoolExecutor: good if most of your time is I/O (e.g. loading images).
-    #   - ProcessPoolExecutor: can bypass GIL, might help for CPU-bound tasks.
-    # For GPU usage, often single-thread or small concurrency can still be enough.
 
     with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
         # Submit a job for each image
@@ -283,6 +280,7 @@ class Parser:
     def __init__(
         self,
         data_dir: str,
+        lidar_data_path: str = None,
         total_iterations: int = 30_000,
         factor: int = 1,
         normalize: bool = False,
@@ -477,6 +475,34 @@ class Parser:
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
+
+        if lidar_data is not None:
+            colmap_points = self.points  # (N, 3)
+            colmap_colors = self.points_rgb  # (N, 3)
+
+            las = laspy.read(lidar_data_path)
+            lidar_xyz = np.vstack((las.x, las.y, las.z)).T
+
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(lidar_xyz)
+
+            nb_neighbors = 20
+            std_ratio = 2.0
+            pcd_inliers, inlier_indices = pcd.remove_statistical_outlier(
+                nb_neighbors=nb_neighbors,
+                std_ratio=std_ratio
+            )
+            # Convert the inlier point cloud back to NumPy
+            xyz_inliers = np.asarray(pcd_inliers.points)  # shape (M_inliers, 3)
+
+            colmap_kd = cKDTree(colmap_points)
+
+            dists, nn_indices = colmap_kd.query(xyz_inliers)
+
+            inlier_colors = colmap_colors[nn_indices]  # shape (M_inliers, 3)
+
+            self.points = xyz_inliers  # (M_inliers, 3)
+            self.points_rgb = inlier_colors  # (M_inliers, 3)
 
         # load one image to check the size. In the case of tanksandtemples dataset, the
         # intrinsics stored in COLMAP corresponds to 2x upsampled images.

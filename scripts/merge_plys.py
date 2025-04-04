@@ -130,51 +130,76 @@ def process_plys(input_dir: str, output_path: str, pattern: str = "*.ply"):
     print(f"Saved merged PLY to {output_path}")
 
 def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = None):
-    # Convert all tensors to numpy arrays in one go
     print(f"Saving ply to {dir}")
+
+    # Convert all tensors to numpy arrays
     numpy_data = {k: v.detach().cpu().numpy() for k, v in splats.items()}
 
+    # Extract data arrays
     means = numpy_data["means"]
     scales = numpy_data["scales"]
     quats = numpy_data["quats"]
     opacities = numpy_data["opacities"]
+
+    # Handle colors or spherical harmonics based on whether colors is provided
+    if colors is not None:
+        colors = colors.detach().cpu().numpy()
+        print("colors")
+    else:
+        print("sh0")
+        print(numpy_data)
+        sh0 = numpy_data["sh0"].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
+        shN = numpy_data["shN"].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
+        print(f"shape sh0 f{sh0.shape}")
+        print(f"shape shN f{shN.shape}")
+
+    # Initialize ply_data with positions and normals
     ply_data = {
         "positions": o3d.core.Tensor(means, dtype=o3d.core.Dtype.Float32),
         "normals": o3d.core.Tensor(np.zeros_like(means), dtype=o3d.core.Dtype.Float32),
-        "opacity": o3d.core.Tensor(
-            opacities.reshape(-1, 1), dtype=o3d.core.Dtype.Float32
-        ),
     }
 
+    # Add features
     if colors is not None:
-        color = colors.detach().cpu().numpy().copy()  #
-        for j in range(color.shape[1]):
-            # Needs to be converted to shs as that's what all viewers take.
+        print("colors2")
+        # Use provided colors, converted to SH coefficients
+        for j in range(colors.shape[1]):
             ply_data[f"f_dc_{j}"] = o3d.core.Tensor(
-                (color[:, j : j + 1] - 0.5) / 0.2820947917738781,
+                (colors[:, j: j + 1] - 0.5) / 0.2820947917738781,
                 dtype=o3d.core.Dtype.Float32,
                 )
     else:
-        sh0 = numpy_data["sh0"].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
-        shN = numpy_data["shN"].transpose(0, 2, 1).reshape(means.shape[0], -1).copy()
-
-        # Add sh0 and shN data
-        for i, data in enumerate([sh0, shN]):
-            prefix = "f_dc" if i == 0 else "f_rest"
-            for j in range(data.shape[1]):
-                ply_data[f"{prefix}_{j}"] = o3d.core.Tensor(
-                    data[:, j : j + 1], dtype=o3d.core.Dtype.Float32
-                )
-
-    # Add scales and quats data
-    for name, data in [("scale", scales), ("rot", quats)]:
-        for i in range(data.shape[1]):
-            ply_data[f"{name}_{i}"] = o3d.core.Tensor(
-                data[:, i : i + 1], dtype=o3d.core.Dtype.Float32
+        print(f"shape sh0 f{sh0.shape}")
+        print(f"shape shN f{shN.shape}")
+        # Use spherical harmonics (sh0 for DC, shN for rest)
+        for j in range(sh0.shape[1]):
+            ply_data[f"f_dc_{j}"] = o3d.core.Tensor(
+                sh0[:, j: j + 1], dtype=o3d.core.Dtype.Float32
+            )
+        for j in range(shN.shape[1]):
+            ply_data[f"f_rest_{j}"] = o3d.core.Tensor(
+                shN[:, j: j + 1], dtype=o3d.core.Dtype.Float32
             )
 
-    pcd = o3d.t.geometry.PointCloud(ply_data)
+    # Add opacity
+    ply_data["opacity"] = o3d.core.Tensor(
+        opacities.reshape(-1, 1), dtype=o3d.core.Dtype.Float32
+    )
 
+    # Add scales
+    for i in range(scales.shape[1]):
+        ply_data[f"scale_{i}"] = o3d.core.Tensor(
+            scales[:, i: i + 1], dtype=o3d.core.Dtype.Float32
+        )
+
+    # Add rotations
+    for i in range(quats.shape[1]):
+        ply_data[f"rot_{i}"] = o3d.core.Tensor(
+            quats[:, i: i + 1], dtype=o3d.core.Dtype.Float32
+        )
+
+    # Create and save the point cloud
+    pcd = o3d.t.geometry.PointCloud(ply_data)
     success = o3d.t.io.write_point_cloud(dir, pcd)
     assert success, "Could not save ply file."
 

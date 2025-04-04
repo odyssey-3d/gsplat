@@ -17,11 +17,6 @@ import viser
 import yaml
 from pathlib import Path
 from datasets.colmap import Dataset, Parser
-from datasets.traj import (
-    generate_interpolated_path,
-    generate_ellipse_path_z,
-    generate_spiral_path,
-)
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -55,12 +50,15 @@ class Config:
     # Render trajectory path
     render_traj_path: str = "interp"
 
-    # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "/home/paja/data/alex_new"
+    # Path to dataset
+    data_dir: str = "/media/paja/T7/test_lidar_scene/colmap"
+    # Path to lidar data
+    lidar_data_path: str = None
+
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
-    result_dir: str = "results/office_lobby_new"
+    result_dir: str = "results/lidar_test_dash_gs/"
     # Every N images there is a test image
     test_every: int = -1
     # Random crop size for training  (experimental)
@@ -85,7 +83,7 @@ class Config:
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [30_000])
+    save_steps: List[int] = field(default_factory=lambda: [10_000, 20_000, 30_000, 40_000])
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -463,6 +461,7 @@ class Runner:
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
             data_dir=cfg.data_dir,
+            lidar_data_path=cfg.lidar_data_path,
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
