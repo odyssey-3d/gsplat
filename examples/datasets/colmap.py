@@ -654,7 +654,7 @@ class Parser:
         camera_locations = camtoworlds[:, :3, 3]
         scene_center = np.mean(camera_locations, axis=0)
         dists = np.linalg.norm(self.points - scene_center, axis=1)
-        self.scene_scale = np.sum(dists, axis=0) / self.points.shape[0]
+        self.scene_scale = np.median(dists)
 
         # Build frequency schedule
         self.schedule = None
