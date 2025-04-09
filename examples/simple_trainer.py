@@ -655,6 +655,7 @@ class Runner:
                 rasterize_mode=rasterize_mode,
                 distributed=self.world_size > 1,
                 camera_model=self.cfg.camera_model,
+                scene_scale=self.scene_scale,
                 **kwargs,
             )
         except Exception as e:

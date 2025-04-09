@@ -5,7 +5,7 @@ from typing import Any, Dict, Union
 from typing_extensions import Literal
 
 from .base import Strategy
-from .ops import remove, duplicate, split, split_edc
+from .ops import remove, duplicate, split_new, split_edc
 from .ops import inject_noise_to_position_new
 from .ops import _update_param_with_optimizer
 
@@ -325,7 +325,7 @@ class DefaultStrategy(Strategy):
         # extend is_split by that many “False” entries
         is_split = torch.cat([is_split, torch.zeros(n_dupli, dtype=torch.bool, device=device)], dim=0)
         if n_split > 0:
-            split_edc(
+            split_new(
                 params=params,
                 optimizers=optimizers,
                 state=state,

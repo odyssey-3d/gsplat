@@ -35,6 +35,7 @@ def rasterization(
     Ks: Tensor,  # [C, 3, 3]
     width: int,
     height: int,
+    scene_scale: float,
     near_plane: float = 0.01,
     far_plane: float = 1e10,
     radius_clip: float = 0.0,
@@ -527,6 +528,7 @@ def rasterization(
     )
 
     # print("rank", world_rank, "Before rasterize_to_pixels")
+    depths = depths / scene_scale
     if colors.shape[-1] > channel_chunk:
         # slice into chunks
         n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk
@@ -548,6 +550,7 @@ def rasterization(
                 tile_size,
                 isect_offsets,
                 flatten_ids,
+                depths,
                 backgrounds=backgrounds_chunk,
                 packed=packed,
                 absgrad=absgrad,
@@ -567,6 +570,7 @@ def rasterization(
             tile_size,
             isect_offsets,
             flatten_ids,
+            depths=depths,
             backgrounds=backgrounds,
             packed=packed,
             absgrad=absgrad,
