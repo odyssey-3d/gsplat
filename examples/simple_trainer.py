@@ -2,6 +2,7 @@ import json
 import math
 import os
 import time
+import traceback
 from dataclasses import dataclass, field
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
@@ -17,11 +18,6 @@ import viser
 import yaml
 from pathlib import Path
 from datasets.colmap import Dataset, Parser
-from datasets.traj import (
-    generate_interpolated_path,
-    generate_ellipse_path_z,
-    generate_spiral_path,
-)
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -55,12 +51,15 @@ class Config:
     # Render trajectory path
     render_traj_path: str = "interp"
 
-    # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "/home/paja/data/alex_new"
+    # Path to dataset
+    data_dir: str = "/media/paja/T7/test_lidar_scene/colmap"
+    # Path to lidar data
+    lidar_data_path: Optional[str] = None
+
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
-    result_dir: str = "results/office_lobby_new"
+    result_dir: str = "results/lidar_test_dash_gs/"
     # Every N images there is a test image
     test_every: int = -1
     # Random crop size for training  (experimental)
@@ -85,7 +84,7 @@ class Config:
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [30_000])
+    save_steps: List[int] = field(default_factory=lambda: [10_000, 20_000, 30_000, 40_000])
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -463,9 +462,12 @@ class Runner:
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
             data_dir=cfg.data_dir,
+            lidar_data_path=cfg.lidar_data_path,
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
+            world_rank=world_rank,
+            world_size=world_size,
         )
         self.trainset = Dataset(
             self.parser,
@@ -657,6 +659,8 @@ class Runner:
             )
         except Exception as e:
             print(e)
+            traceback.print_exc()
+            raise
         if masks is not None:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
@@ -716,289 +720,299 @@ class Runner:
             persistent_workers=True,
             pin_memory=True,
         )
-        trainloader_iter = iter(trainloader)
-
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
-        for step in pbar:
-            if not cfg.disable_viewer:
-                while self.viewer.state.status == "paused":
-                    time.sleep(0.01)
-                self.viewer.lock.acquire()
-                tic = time.time()
+        step = init_step
+        while step < max_steps:
+            for data in trainloader:
+                if not cfg.disable_viewer:
+                    while self.viewer.state.status == "paused":
+                        time.sleep(0.01)
+                    self.viewer.lock.acquire()
+                    tic = time.time()
 
-            self.trainset.update_iteration(step)
-            try:
-                data = next(trainloader_iter)
-            except StopIteration:
-                trainloader_iter = iter(trainloader)
-                data = next(trainloader_iter)
+                self.trainset.update_iteration(step)
 
-            camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
-            image_mask = None
-            if image_mask in data:
-                image_mask = data["image_mask"].to(device)
-                image_mask = image_mask.permute(1,2,0).unsqueeze(0)
-            Ks = data["K"].to(device)  # [1, 3, 3]
-            pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
-            #assert pixels.shape == image_mask.shape, f"pixels.shape {pixels.shape}, image_mask.shape {image_mask.shape}"
-            #save_step_images(pixels, image_mask, ".", step)
-            num_train_rays_per_step = (
-                pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
-            )
-            image_ids = data["image_id"].to(device)
-            masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
-            if cfg.depth_loss:
-                points = data["points"].to(device)  # [1, M, 2]
-                depths_gt = data["depths"].to(device)  # [1, M]
-
-            height, width = pixels.shape[1:3]
-
-            if cfg.pose_noise:
-                camtoworlds = self.pose_perturb(camtoworlds, image_ids)
-
-            if cfg.pose_opt:
-                camtoworlds = self.pose_adjust(camtoworlds, image_ids)
-
-            # sh schedule
-            sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
-
-            # forward
-            renders, alphas, info = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=sh_degree_to_use,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
-                masks=masks,
-            )
-            if renders.shape[-1] == 4:
-                colors, depths = renders[..., 0:3], renders[..., 3:4]
-            else:
-                colors, depths = renders, None
-
-            if image_mask is not None:
-                colors = colors * image_mask
-                pixels = pixels * image_mask
-            if cfg.use_bilateral_grid:
-                grid_y, grid_x = torch.meshgrid(
-                    (torch.arange(height, device=self.device) + 0.5) / height,
-                    (torch.arange(width, device=self.device) + 0.5) / width,
-                    indexing="ij",
+                camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
+                image_mask = None
+                if image_mask in data:
+                    image_mask = data["image_mask"].to(device)
+                    image_mask = image_mask.permute(1,2,0).unsqueeze(0)
+                Ks = data["K"].to(device)  # [1, 3, 3]
+                pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+                #assert pixels.shape == image_mask.shape, f"pixels.shape {pixels.shape}, image_mask.shape {image_mask.shape}"
+                #save_step_images(pixels, image_mask, ".", step)
+                num_train_rays_per_step = (
+                    pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
                 )
-                grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
-                colors = slice(self.bil_grids, grid_xy, colors, image_ids)["rgb"]
-
-            if cfg.random_bkgd:
-                bkgd = torch.rand(1, 3, device=device)
-                colors = colors + bkgd * (1.0 - alphas)
-
-            self.cfg.strategy.step_pre_backward(
-                params=self.splats,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=step,
-                info=info,
-            )
-
-            # loss
-            l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            )
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
-            if cfg.depth_loss:
-                # query depths from depth map
-                points = torch.stack(
-                    [
-                        points[:, :, 0] / (width - 1) * 2 - 1,
-                        points[:, :, 1] / (height - 1) * 2 - 1,
-                    ],
-                    dim=-1,
-                )  # normalize to [-1, 1]
-                grid = points.unsqueeze(2)  # [1, M, 1, 2]
-                depths = F.grid_sample(
-                    depths.permute(0, 3, 1, 2), grid, align_corners=True
-                )  # [1, 1, M, 1]
-                depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                # calculate loss in disparity space
-                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-                disp_gt = 1.0 / depths_gt  # [1, M]
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
-                loss += depthloss * cfg.depth_lambda
-            if cfg.use_bilateral_grid:
-                tvloss = 10 * total_variation_loss(self.bil_grids.grids)
-                loss += tvloss
-
-            # regularizations
-            if cfg.opacity_reg > 0.0:
-                loss = (
-                    loss
-                    + cfg.opacity_reg
-                    * torch.abs(torch.sigmoid(self.splats["opacities"])).mean()
-                )
-            if cfg.scale_reg > 0.0:
-                loss = (
-                    loss
-                    + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
-                )
-
-            loss.backward()
-
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
-            if cfg.depth_loss:
-                desc += f"depth loss={depthloss.item():.6f}| "
-            if cfg.pose_opt and cfg.pose_noise:
-                # monitor the pose error if we inject noise
-                pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
-                desc += f"pose err={pose_err.item():.6f}| "
-            pbar.set_description(desc)
-
-            # write images (gt and render)
-            # if world_rank == 0 and step % 800 == 0:
-            #     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
-            #     canvas = canvas.reshape(-1, *canvas.shape[2:])
-            #     imageio.imwrite(
-            #         f"{self.render_dir}/train_rank{self.world_rank}.png",
-            #         (canvas * 255).astype(np.uint8),
-            #     )
-
-            if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
-                mem = torch.cuda.max_memory_allocated() / 1024**3
-                self.writer.add_scalar("train/loss", loss.item(), step)
-                self.writer.add_scalar("train/l1loss", l1loss.item(), step)
-                self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
-                self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
-                self.writer.add_scalar("train/mem", mem, step)
+                image_ids = data["image_id"].to(device)
+                masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
                 if cfg.depth_loss:
-                    self.writer.add_scalar("train/depthloss", depthloss.item(), step)
-                if cfg.use_bilateral_grid:
-                    self.writer.add_scalar("train/tvloss", tvloss.item(), step)
-                if cfg.tb_save_image:
-                    canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
-                    canvas = canvas.reshape(-1, *canvas.shape[2:])
-                    self.writer.add_image("train/render", canvas, step)
-                self.writer.flush()
+                    points = data["points"].to(device)  # [1, M, 2]
+                    depths_gt = data["depths"].to(device)  # [1, M]
 
-            # save checkpoint before updating the model
-            if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
-                mem = torch.cuda.max_memory_allocated() / 1024**3
-                stats = {
-                    "mem": mem,
-                    "ellipse_time": time.time() - global_tic,
-                    "num_GS": len(self.splats["means"]),
-                }
-                print("Step: ", step, stats)
-                with open(
-                    f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json",
-                    "w",
-                ) as f:
-                    json.dump(stats, f)
-                data = {"step": step, "splats": self.splats.state_dict()}
+                height, width = pixels.shape[1:3]
+
+                if cfg.pose_noise:
+                    camtoworlds = self.pose_perturb(camtoworlds, image_ids)
+
                 if cfg.pose_opt:
-                    if world_size > 1:
-                        data["pose_adjust"] = self.pose_adjust.module.state_dict()
-                    else:
-                        data["pose_adjust"] = self.pose_adjust.state_dict()
-                if cfg.app_opt:
-                    if world_size > 1:
-                        data["app_module"] = self.app_module.module.state_dict()
-                    else:
-                        data["app_module"] = self.app_module.state_dict()
-                torch.save(
-                    data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
+                    camtoworlds = self.pose_adjust(camtoworlds, image_ids)
+
+                # sh schedule
+                sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
+
+                # forward
+                try:
+                    renders, alphas, info = self.rasterize_splats(
+                        camtoworlds=camtoworlds,
+                        Ks=Ks,
+                        width=width,
+                        height=height,
+                        sh_degree=sh_degree_to_use,
+                        near_plane=cfg.near_plane,
+                        far_plane=cfg.far_plane,
+                        image_ids=image_ids,
+                        render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                        masks=masks,
+                    )
+                except Exception as e:
+                    traceback.print_exc()
+                    print(e)
+                    raise
+
+                if renders.shape[-1] == 4:
+                    colors, depths = renders[..., 0:3], renders[..., 3:4]
+                else:
+                    colors, depths = renders, None
+
+                if image_mask is not None:
+                    colors = colors * image_mask
+                    pixels = pixels * image_mask
+                if cfg.use_bilateral_grid:
+                    grid_y, grid_x = torch.meshgrid(
+                        (torch.arange(height, device=self.device) + 0.5) / height,
+                        (torch.arange(width, device=self.device) + 0.5) / width,
+                        indexing="ij",
+                    )
+                    grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+                    colors = slice(self.bil_grids, grid_xy, colors, image_ids)["rgb"]
+
+                if cfg.random_bkgd:
+                    bkgd = torch.rand(1, 3, device=device)
+                    colors = colors + bkgd * (1.0 - alphas)
+
+                self.cfg.strategy.step_pre_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
                 )
 
-            # Turn Gradients into Sparse Tensor before running optimizer
-            if cfg.sparse_grad:
-                assert cfg.packed, "Sparse gradients only work with packed mode."
-                gaussian_ids = info["gaussian_ids"]
-                for k in self.splats.keys():
-                    grad = self.splats[k].grad
-                    if grad is None or grad.is_sparse:
-                        continue
-                    self.splats[k].grad = torch.sparse_coo_tensor(
-                        indices=gaussian_ids[None],  # [1, nnz]
-                        values=grad[gaussian_ids],  # [nnz, ...]
-                        size=self.splats[k].size(),  # [N, ...]
-                        is_coalesced=len(Ks) == 1,
+                # loss
+                l1loss = F.l1_loss(colors, pixels)
+                ssimloss = 1.0 - fused_ssim(
+                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                )
+                loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+                if cfg.depth_loss:
+                    # query depths from depth map
+                    points = torch.stack(
+                        [
+                            points[:, :, 0] / (width - 1) * 2 - 1,
+                            points[:, :, 1] / (height - 1) * 2 - 1,
+                        ],
+                        dim=-1,
+                    )  # normalize to [-1, 1]
+                    grid = points.unsqueeze(2)  # [1, M, 1, 2]
+                    depths = F.grid_sample(
+                        depths.permute(0, 3, 1, 2), grid, align_corners=True
+                    )  # [1, 1, M, 1]
+                    depths = depths.squeeze(3).squeeze(1)  # [1, M]
+                    # calculate loss in disparity space
+                    disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
+                    disp_gt = 1.0 / depths_gt  # [1, M]
+                    depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                    loss += depthloss * cfg.depth_lambda
+                if cfg.use_bilateral_grid:
+                    tvloss = 10 * total_variation_loss(self.bil_grids.grids)
+                    loss += tvloss
+
+                # regularizations
+                if cfg.opacity_reg > 0.0:
+                    loss = (
+                        loss
+                        + cfg.opacity_reg
+                        * torch.abs(torch.sigmoid(self.splats["opacities"])).mean()
+                    )
+                if cfg.scale_reg > 0.0:
+                    loss = (
+                        loss
+                        + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
                     )
 
-            if cfg.visible_adam:
-                gaussian_cnt = self.splats.means.shape[0]
-                if cfg.packed:
-                    visibility_mask = torch.zeros_like(
-                        self.splats["opacities"], dtype=bool
-                    )
-                    visibility_mask.scatter_(0, info["gaussian_ids"], 1)
-                else:
-                    visibility_mask = (info["radii"] > 0).any(0)
+                loss.backward()
 
-            # optimize
-            for optimizer in self.optimizers.values():
+                desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+                num_gs = len(self.splats["means"])
+                desc += f"GS={num_gs}| "
+                downsample_factor = data["downsample_factor"]
+                desc += f"Factor={downsample_factor.item():.2f}| "
+                if cfg.depth_loss:
+                    desc += f"depth loss={depthloss.item():.6f}| "
+                if cfg.pose_opt and cfg.pose_noise:
+                    # monitor the pose error if we inject noise
+                    pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
+                    desc += f"pose err={pose_err.item():.6f}| "
+                pbar.set_description(desc)
+
+                # write images (gt and render)
+                # if world_rank == 0 and step % 800 == 0:
+                #     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
+                #     canvas = canvas.reshape(-1, *canvas.shape[2:])
+                #     imageio.imwrite(
+                #         f"{self.render_dir}/train_rank{self.world_rank}.png",
+                #         (canvas * 255).astype(np.uint8),
+                #     )
+
+                if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
+                    mem = torch.cuda.max_memory_allocated() / 1024**3
+                    self.writer.add_scalar("train/loss", loss.item(), step)
+                    self.writer.add_scalar("train/l1loss", l1loss.item(), step)
+                    self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
+                    self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
+                    self.writer.add_scalar("train/mem", mem, step)
+                    if cfg.depth_loss:
+                        self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                    if cfg.use_bilateral_grid:
+                        self.writer.add_scalar("train/tvloss", tvloss.item(), step)
+                    if cfg.tb_save_image:
+                        canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
+                        canvas = canvas.reshape(-1, *canvas.shape[2:])
+                        self.writer.add_image("train/render", canvas, step)
+                    self.writer.flush()
+
+                # save checkpoint before updating the model
+                if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
+                    mem = torch.cuda.max_memory_allocated() / 1024**3
+                    stats = {
+                        "mem": mem,
+                        "ellipse_time": time.time() - global_tic,
+                        "num_GS": len(self.splats["means"]),
+                    }
+                    print("Step: ", step, stats)
+                    with open(
+                        f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json",
+                        "w",
+                    ) as f:
+                        json.dump(stats, f)
+                    data = {"step": step, "splats": self.splats.state_dict()}
+                    if cfg.pose_opt:
+                        if world_size > 1:
+                            data["pose_adjust"] = self.pose_adjust.module.state_dict()
+                        else:
+                            data["pose_adjust"] = self.pose_adjust.state_dict()
+                    if cfg.app_opt:
+                        if world_size > 1:
+                            data["app_module"] = self.app_module.module.state_dict()
+                        else:
+                            data["app_module"] = self.app_module.state_dict()
+                    torch.save(
+                        data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
+                    )
+
+                # Turn Gradients into Sparse Tensor before running optimizer
+                if cfg.sparse_grad:
+                    assert cfg.packed, "Sparse gradients only work with packed mode."
+                    gaussian_ids = info["gaussian_ids"]
+                    for k in self.splats.keys():
+                        grad = self.splats[k].grad
+                        if grad is None or grad.is_sparse:
+                            continue
+                        self.splats[k].grad = torch.sparse_coo_tensor(
+                            indices=gaussian_ids[None],  # [1, nnz]
+                            values=grad[gaussian_ids],  # [nnz, ...]
+                            size=self.splats[k].size(),  # [N, ...]
+                            is_coalesced=len(Ks) == 1,
+                        )
+
                 if cfg.visible_adam:
-                    optimizer.step(visibility_mask)
-                else:
+                    gaussian_cnt = self.splats.means.shape[0]
+                    if cfg.packed:
+                        visibility_mask = torch.zeros_like(
+                            self.splats["opacities"], dtype=bool
+                        )
+                        visibility_mask.scatter_(0, info["gaussian_ids"], 1)
+                    else:
+                        visibility_mask = (info["radii"] > 0).any(0)
+
+                # optimize
+                for optimizer in self.optimizers.values():
+                    if cfg.visible_adam:
+                        optimizer.step(visibility_mask)
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.pose_optimizers:
                     optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.pose_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.app_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.bil_grid_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for scheduler in schedulers:
-                scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.app_optimizers:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.bil_grid_optimizers:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                for scheduler in schedulers:
+                    scheduler.step()
 
-            # Run post-backward steps after backward and optimizer
-            if isinstance(self.cfg.strategy, DefaultStrategy):
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    lr=schedulers[0].get_last_lr()[0],
-                    step=step,
-                    info=info,
-                    packed=cfg.packed,
-                )
-            elif isinstance(self.cfg.strategy, MCMCStrategy):
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    lr=schedulers[0].get_last_lr()[0],
-                )
-            else:
-                assert_never(self.cfg.strategy)
+                # Run post-backward steps after backward and optimizer
+                if isinstance(self.cfg.strategy, DefaultStrategy):
+                    self.cfg.strategy.step_post_backward(
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                        lr=schedulers[0].get_last_lr()[0],
+                        step=step,
+                        info=info,
+                        packed=cfg.packed,
+                    )
+                elif isinstance(self.cfg.strategy, MCMCStrategy):
+                    self.cfg.strategy.step_post_backward(
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                        step=step,
+                        info=info,
+                        lr=schedulers[0].get_last_lr()[0],
+                    )
+                else:
+                    assert_never(self.cfg.strategy)
 
-            # eval the full set
-            if step in [i - 1 for i in cfg.eval_steps] and cfg.test_every > 0:
-                self.eval(step)
+                # eval the full set
+                if step in [i - 1 for i in cfg.eval_steps] and cfg.test_every > 0:
+                    self.eval(step)
 
-            # run compression
-            if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
-                self.run_compression(step=step)
+                # run compression
+                if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
+                    self.run_compression(step=step)
 
-            if not cfg.disable_viewer:
-                self.viewer.lock.release()
-                num_train_steps_per_sec = 1.0 / (time.time() - tic)
-                num_train_rays_per_sec = (
-                    num_train_rays_per_step * num_train_steps_per_sec
-                )
-                # Update the viewer state.
-                self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
-                # Update the scene.
-                self.viewer.update(step, num_train_rays_per_step)
+                if not cfg.disable_viewer:
+                    self.viewer.lock.release()
+                    num_train_steps_per_sec = 1.0 / (time.time() - tic)
+                    num_train_rays_per_sec = (
+                        num_train_rays_per_step * num_train_steps_per_sec
+                    )
+                    # Update the viewer state.
+                    self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
+                    # Update the scene.
+                    self.viewer.update(step, num_train_rays_per_step)
+
+                step +=1
+                pbar.update(1)
+                if step >= max_steps:
+                    break
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
@@ -1109,14 +1123,20 @@ class Runner:
         c2w = torch.from_numpy(c2w).float().to(self.device)
         K = torch.from_numpy(K).float().to(self.device)
 
-        render_colors, _, _ = self.rasterize_splats(
-            camtoworlds=c2w[None],
-            Ks=K[None],
-            width=W,
-            height=H,
-            sh_degree=self.cfg.sh_degree,  # active all SH degrees
-            radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
-        )  # [1, H, W, 3]
+
+        try:
+            render_colors, _, _ = self.rasterize_splats(
+                camtoworlds=c2w[None],
+                Ks=K[None],
+                width=W,
+                height=H,
+                sh_degree=self.cfg.sh_degree,  # active all SH degrees
+                radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
+            )  # [1, H, W, 3]
+        except Exception as e:
+            traceback.print_exc()
+            print(e)
+            render_colors = torch.zeros((1, H, W, 3), dtype=torch.float32, device=self.device)
         return render_colors[0].cpu().numpy()
 
 
