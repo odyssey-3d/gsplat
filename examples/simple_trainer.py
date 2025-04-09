@@ -54,7 +54,7 @@ class Config:
     # Path to dataset
     data_dir: str = "/media/paja/T7/test_lidar_scene/colmap"
     # Path to lidar data
-    lidar_data_path: Optional[str] = None
+    lidar_data_path: Optional[str] = "/media/paja/T7/test_lidar_scene/lidar/lidar-0.01-resolution_optimized.las"
 
     # Downsample factor for the dataset
     data_factor: int = 1
@@ -130,7 +130,7 @@ class Config:
     scale_reg: float = 0.001
 
     # Enable camera optimization.
-    pose_opt: bool = False
+    pose_opt: bool = True
     # Learning rate for camera optimization
     pose_opt_lr: float = 1e-5
     # Regularization for camera optimization as weight decay
