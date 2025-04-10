@@ -89,7 +89,7 @@ def process_single_image(
 
         return full_energy, down_energies
 
-    except Exception as ex:
+    except Exception:
         # Log or silently skip
         return None, {}
 
@@ -221,9 +221,9 @@ def allocate_iterations_by_frequency(S, XF_full, down_list):
         # Add/remove difference to/from the longest stage (usually full-res)
         longest_stage_idx = -1
         max_steps = -1
-        for idx, (f, s) in enumerate(schedule):
-            if s > max_steps:
-                max_steps = s
+        for idx, (f, st) in enumerate(schedule):
+            if st > max_steps:
+                max_steps = st
                 longest_stage_idx = idx
 
         if longest_stage_idx != -1:
@@ -430,15 +430,15 @@ class Parser:
             print(f"Warning: Mask folder {mask_dir} does not exist. Proceeding without masks.")
             image_mask_paths = [None] * len(image_names)
 
-        # Load 3D points
+        # Load 3D points from COLMAP
         points = manager.points3D.astype(np.float32)
         points_err = manager.point3D_errors.astype(np.float32)
         points_rgb = manager.point3D_colors.astype(np.uint8)
 
         point_indices = {}
         image_id_to_name = {v: k for k, v in manager.name_to_image_id.items()}
-        for point_id, data in manager.point3D_id_to_images.items():
-            for image_id, _ in data:
+        for point_id, data_ in manager.point3D_id_to_images.items():
+            for image_id, _ in data_:
                 image_name = image_id_to_name[image_id]
                 point_idx = manager.point3D_id_to_point3D_idx[point_id]
                 point_indices.setdefault(image_name, []).append(point_idx)
@@ -446,7 +446,7 @@ class Parser:
             k: np.array(v).astype(np.int32) for k, v in point_indices.items()
         }
 
-        # Optionally normalize
+        # Optional normalization
         if normalize:
             T1 = similarity_from_cameras(camtoworlds)
             camtoworlds = transform_cameras(T1, camtoworlds)
@@ -473,16 +473,15 @@ class Parser:
         self.point_indices = point_indices
         self.transform = transform
 
+        # Track removed indices
         removed_indices = []
         if os.path.exists(mask_dir):
             keep_indices = []
             removed_debug_dir = os.path.join(data_dir, "removed_images_debug")
             os.makedirs(removed_debug_dir, exist_ok=True)
 
-            # Define threshold for fraction of masked area
-            # (If fraction_masked > 0.4 => discard)
+            # Thresholds
             fraction_mask_threshold = 0.4
-            # Define a minimum sharpness threshold
             sharpness_threshold = 80
 
             print("Filtering images by mask (discard if more than 40% is >127) and sharpness...")
@@ -511,21 +510,17 @@ class Parser:
                 masked_area = np.count_nonzero(mask_img > 127)
                 fraction_masked = masked_area / total_area
 
-                # Now check sharpness
+                # Check sharpness
                 orig_img_path = self.image_paths[i]
                 color_img = cv2.imread(orig_img_path, cv2.IMREAD_COLOR)
                 if color_img is None:
                     logging.warning(f"Failed to read original image {orig_img_path}, discarding.")
                     removed_indices.append(i)
-                    # Save a dummy file for debugging if needed
-                    base_name = os.path.basename(orig_img_path)
-                    debug_outpath = os.path.join(removed_debug_dir, f"FAILED_{base_name}")
                     continue
 
                 sharp_val = measure_sharpness(color_img)
 
                 # We discard if fraction_masked > 0.4 OR not sharp
-                # (i.e. sharp_val < sharpness_threshold)
                 if fraction_masked > fraction_mask_threshold or sharp_val < sharpness_threshold:
                     removed_indices.append(i)
                     # Save to debug folder
@@ -551,6 +546,7 @@ class Parser:
                   f"due to mask coverage or sharpness. See '{os.path.join(data_dir, 'removed_images_debug')}' "
                   "for removed images.")
 
+        self.lidar_points = None
         if lidar_data_path is not None:
             colmap_points = self.points
             colmap_colors = self.points_rgb
@@ -558,21 +554,37 @@ class Parser:
             las = laspy.read(lidar_data_path)
             lidar_xyz = np.vstack((las.x, las.y, las.z)).T
 
+            # Remove outliers
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(lidar_xyz)
-
-            nb_neighbors = 20
-            std_ratio = 2.0
             pcd_inliers, inlier_indices = pcd.remove_statistical_outlier(
-                nb_neighbors=nb_neighbors,
-                std_ratio=std_ratio
+                nb_neighbors=20,
+                std_ratio=2.0
             )
-            xyz_inliers = np.asarray(pcd_inliers.points)
+            xyz_inliers = np.asarray(pcd_inliers.points, dtype=np.float32)  # shape [M,3]
+
+            # color from nearest COLMAP
             colmap_kd = cKDTree(colmap_points)
             dists, nn_indices = colmap_kd.query(xyz_inliers)
-            inlier_colors = colmap_colors[nn_indices]
-            self.points = xyz_inliers
-            self.points_rgb = inlier_colors
+            inlier_colors = colmap_colors[nn_indices]  # shape [M,3]
+
+            # 50% subsample
+            M = xyz_inliers.shape[0]
+            if M > 0:
+                chosen_count = M // 2
+                chosen_inds = np.random.choice(M, size=chosen_count, replace=False)
+                xyz_inliers_sub = xyz_inliers[chosen_inds]
+                inlier_colors_sub = inlier_colors[chosen_inds]
+            else:
+                xyz_inliers_sub = np.zeros((0, 3), dtype=np.float32)
+                inlier_colors_sub = np.zeros((0, 3), dtype=np.uint8)
+
+            # Combine
+            new_points = np.concatenate([colmap_points, xyz_inliers_sub], axis=0)
+            new_colors = np.concatenate([colmap_colors, inlier_colors_sub], axis=0)
+
+            self.points = new_points
+            self.points_rgb = new_colors
 
         # Make sure there's at least one valid image
         if len(self.image_paths) == 0:
@@ -626,11 +638,16 @@ class Parser:
                 x1 = (grid_x - cx_) / fx_
                 y1 = (grid_y - cy_) / fy_
                 theta = np.sqrt(x1**2 + y1**2)
-                r_ = (1.0 + params[0] * theta**2 + params[1] * theta**4
-                      + params[2] * theta**6 + params[3] * theta**8)
+                r_ = (
+                    1.0
+                    + params[0] * theta**2
+                    + params[1] * theta**4
+                    + params[2] * theta**6
+                    + params[3] * theta**8
+                )
                 mapx = (fx_ * x1 * r_ + width // 2).astype(np.float32)
                 mapy = (fy_ * y1 * r_ + height // 2).astype(np.float32)
-                mask_ = (mapx > 0) & (mapy > 0) & (mapx < (width-1)) & (mapy < (height-1))
+                mask_ = (mapx > 0) & (mapy > 0) & (mapx < (width - 1)) & (mapy < (height - 1))
                 ys, xs = np.nonzero(mask_)
                 y_min, y_max = ys.min(), ys.max() + 1
                 x_min, x_max = xs.min(), xs.max() + 1
@@ -874,17 +891,28 @@ class Dataset(torch.utils.data.Dataset):
                         alt_mask = alt_mask[rand_y:rand_y + ds_patch_size, rand_x:rand_x + ds_patch_size]
                     data["mask"] = torch.from_numpy(alt_mask).bool()
 
-        # Depths
+        # ----------------------------
+        # Depths: Prefer LiDAR if available, else fallback to COLMAP points
+        # ----------------------------
         if self.load_depths:
             try:
                 w2c = np.linalg.inv(c2w)
-                im_name = self.parser.image_names[idx]
-                p_indices = self.parser.point_indices.get(im_name, [])
-                p_world = self.parser.points[p_indices]
+
+                if getattr(self.parser, "lidar_points", None) is not None:
+                    # 1) Use LiDAR points
+                    p_world = self.parser.lidar_points
+                else:
+                    # 2) Fallback: use COLMAP points + point_indices
+                    im_name = self.parser.image_names[idx]
+                    p_indices = self.parser.point_indices.get(im_name, [])
+                    p_world = self.parser.points[p_indices]
+
                 p_cam = (w2c[:3, :3] @ p_world.T + w2c[:3, 3:4]).T
                 p_proj = (K_adj @ p_cam.T).T
                 proj_xy = p_proj[:, :2] / (p_proj[:, 2:3] + 1e-8)
                 depths_ = p_cam[:, 2]
+
+                # Filter out-of-frame / negative
                 h_, w_ = image.shape[:2]
                 sel = (
                     (proj_xy[:, 0] >= 0)
@@ -895,8 +923,17 @@ class Dataset(torch.utils.data.Dataset):
                 )
                 proj_xy = proj_xy[sel]
                 depths_ = depths_[sel]
+
+                # Limit max points to avoid huge overhead
+                #max_points = 10_000
+                #if proj_xy.shape[0] > max_points:
+                #    choice = np.random.choice(proj_xy.shape[0], max_points, replace=False)
+                #    proj_xy = proj_xy[choice]
+                #    depths_ = depths_[choice]
+
                 data["points"] = torch.from_numpy(proj_xy).float()
                 data["depths"] = torch.from_numpy(depths_).float()
+
             except Exception as e:
                 logger.warning(f"Depth computation failed for index {idx}: {e}")
                 data["points"] = torch.zeros((0, 2), dtype=torch.float32)
@@ -915,17 +952,23 @@ class Dataset(torch.utils.data.Dataset):
         with self._current_iter.get_lock():
             self._current_iter.value = current_iter
 
+
 if __name__ == "__main__":
     import argparse
 
     parser_cli = argparse.ArgumentParser()
     parser_cli.add_argument("--data_dir", type=str, default="data/360_v2/garden")
     parser_cli.add_argument("--factor", type=int, default=4)
+    parser_cli.add_argument("--lidar_data_path", type=str, default=None, help="Path to LiDAR (.las) file")
     args = parser_cli.parse_args()
 
     # Parse COLMAP data
     parser = Parser(
-        data_dir=args.data_dir, factor=args.factor, normalize=True, test_every=8
+        data_dir=args.data_dir,
+        factor=args.factor,
+        normalize=True,
+        test_every=8,
+        lidar_data_path=args.lidar_data_path,
     )
     dataset = Dataset(parser, split="train", load_depths=True)
     print(f"Dataset: {len(dataset)} images.")
