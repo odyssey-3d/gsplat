@@ -2,6 +2,7 @@ import json
 import math
 import os
 import time
+import traceback
 from dataclasses import dataclass, field
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
@@ -17,11 +18,6 @@ import viser
 import yaml
 from pathlib import Path
 from datasets.colmap import Dataset, Parser
-from datasets.traj import (
-    generate_interpolated_path,
-    generate_ellipse_path_z,
-    generate_spiral_path,
-)
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -55,12 +51,15 @@ class Config:
     # Render trajectory path
     render_traj_path: str = "interp"
 
-    # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "/home/paja/data/fasnacht"
+    # Path to dataset
+    data_dir: str = "/media/paja/T7/test_lidar_scene/colmap"
+    # Path to lidar data
+    lidar_data_path: Optional[str] = "/media/paja/T7/test_lidar_scene/lidar/lidar-0.01-resolution_optimized.las"
+
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
-    result_dir: str = "results/office_lobby_new"
+    result_dir: str = "results/lidar_test_dash_gs/"
     # Every N images there is a test image
     test_every: int = -1
     # Random crop size for training  (experimental)
@@ -85,7 +84,7 @@ class Config:
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [30_000])
+    save_steps: List[int] = field(default_factory=lambda: [10_000, 20_000, 30_000, 40_000])
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -131,7 +130,7 @@ class Config:
     scale_reg: float = 0.001
 
     # Enable camera optimization.
-    pose_opt: bool = False
+    pose_opt: bool = True
     # Learning rate for camera optimization
     pose_opt_lr: float = 1e-5
     # Regularization for camera optimization as weight decay
@@ -463,9 +462,12 @@ class Runner:
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
             data_dir=cfg.data_dir,
+            lidar_data_path=cfg.lidar_data_path,
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
+            world_rank=world_rank,
+            world_size=world_size,
         )
         self.trainset = Dataset(
             self.parser,
@@ -613,6 +615,8 @@ class Runner:
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
+        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
+        # rasterization does normalization internally
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
@@ -654,9 +658,11 @@ class Runner:
                 camera_model=self.cfg.camera_model,
                 weights=weights,
                 **kwargs,
-        )
+            )
         except Exception as e:
             print(e)
+            traceback.print_exc()
+            raise
         if masks is not None:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
@@ -716,16 +722,12 @@ class Runner:
             persistent_workers=True,
             pin_memory=True,
         )
-
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
-        step = 1
+        step = init_step
         while step < max_steps:
             for data in trainloader:
-                if step >= max_steps:
-                    break
-
                 if not cfg.disable_viewer:
                     while self.viewer.state.status == "paused":
                         time.sleep(0.01)
@@ -764,18 +766,24 @@ class Runner:
                 sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
                 # forward
-                renders, alphas, info = self.rasterize_splats(
-                    camtoworlds=camtoworlds,
-                    Ks=Ks,
-                    width=width,
-                    height=height,
-                    sh_degree=sh_degree_to_use,
-                    near_plane=cfg.near_plane,
-                    far_plane=cfg.far_plane,
-                    image_ids=image_ids,
-                    render_mode="RGB+ED" if cfg.depth_loss else "RGB",
-                    masks=masks,
-                )
+                try:
+                    renders, alphas, info = self.rasterize_splats(
+                        camtoworlds=camtoworlds,
+                        Ks=Ks,
+                        width=width,
+                        height=height,
+                        sh_degree=sh_degree_to_use,
+                        near_plane=cfg.near_plane,
+                        far_plane=cfg.far_plane,
+                        image_ids=image_ids,
+                        render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                        masks=masks,
+                    )
+                except Exception as e:
+                    traceback.print_exc()
+                    print(e)
+                    raise
+
                 if renders.shape[-1] == 4:
                     colors, depths = renders[..., 0:3], renders[..., 3:4]
                 else:
@@ -850,6 +858,10 @@ class Runner:
                 loss.backward()
 
                 desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+                num_gs = len(self.splats["means"])
+                desc += f"GS={num_gs}| "
+                downsample_factor = data["downsample_factor"]
+                desc += f"Factor={downsample_factor.item():.2f}| "
                 if cfg.depth_loss:
                     desc += f"depth loss={depthloss.item():.6f}| "
                 if cfg.pose_opt and cfg.pose_noise:
@@ -968,9 +980,6 @@ class Runner:
                         info=info,
                         packed=cfg.packed,
                     )
-                    if step in [15_000, 24_000]:
-                        importance_mask =  self.importance_score()
-                        self.cfg.strategy.importance_prune(params=self.splats, optimizers=self.optimizers, state=self.strategy_state, mask=importance_mask )
                 elif isinstance(self.cfg.strategy, MCMCStrategy):
                     self.cfg.strategy.step_post_backward(
                         params=self.splats,
@@ -1001,8 +1010,11 @@ class Runner:
                     self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
                     # Update the scene.
                     self.viewer.update(step, num_train_rays_per_step)
-                step += 1
+
+                step +=1
                 pbar.update(1)
+                if step >= max_steps:
+                    break
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
@@ -1086,39 +1098,6 @@ class Runner:
             self.writer.flush()
 
     @torch.no_grad()
-    def importance_score(self):
-        """Entry for trajectory rendering."""
-        print("Running importance_score...")
-        cfg = self.cfg
-        device = self.device
-
-        camtoworlds_all = self.parser.camtoworlds[5:-5]
-        camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
-        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
-        width, height = list(self.parser.imsize_dict.values())[0]
-
-        weights = torch.zeros_like(self.splats["opacities"])
-        for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
-            camtoworlds = camtoworlds_all[i : i + 1]
-            Ks = K[None]
-
-            renders, _, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                render_mode="RGB+ED",
-                weights=weights,
-            )  # [1, H, W, 4]
-
-        mask = weights < 0.01
-        print(f"Number of low contributing GS: {mask.sum().item()} with total gaussians: {len(weights)}")
-        return mask
-
-    @torch.no_grad()
     def run_compression(self, step: int):
         """Entry for running compression."""
         print("Running compression...")
@@ -1146,14 +1125,20 @@ class Runner:
         c2w = torch.from_numpy(c2w).float().to(self.device)
         K = torch.from_numpy(K).float().to(self.device)
 
-        render_colors, _, _ = self.rasterize_splats(
-            camtoworlds=c2w[None],
-            Ks=K[None],
-            width=W,
-            height=H,
-            sh_degree=self.cfg.sh_degree,  # active all SH degrees
-            radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
-        )  # [1, H, W, 3]
+
+        try:
+            render_colors, _, _ = self.rasterize_splats(
+                camtoworlds=c2w[None],
+                Ks=K[None],
+                width=W,
+                height=H,
+                sh_degree=self.cfg.sh_degree,  # active all SH degrees
+                radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
+            )  # [1, H, W, 3]
+        except Exception as e:
+            traceback.print_exc()
+            print(e)
+            render_colors = torch.zeros((1, H, W, 3), dtype=torch.float32, device=self.device)
         return render_colors[0].cpu().numpy()
 
 

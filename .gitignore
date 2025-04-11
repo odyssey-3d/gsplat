@@ -128,5 +128,6 @@ compile_commands.json
 data
 results
 output
+*.ply
 
 !examples/benchmarks/compression/results/
