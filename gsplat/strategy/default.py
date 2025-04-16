@@ -3,6 +3,7 @@ import torch
 from dataclasses import dataclass
 from typing import Any, Dict, Union
 from typing_extensions import Literal
+from typing import Optional
 
 from .base import Strategy
 from .ops import remove, duplicate, split, split_edc
@@ -44,7 +45,7 @@ class DefaultStrategy(Strategy):
     absgrad: bool = False
     revised_opacity: bool = True
     verbose: bool = False
-    binoms: torch.Tensor = None
+    binoms: Optional[torch.Tensor] = None
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
