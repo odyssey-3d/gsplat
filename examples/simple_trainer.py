@@ -610,6 +610,7 @@ class Runner:
         width: int,
         height: int,
         masks: Optional[Tensor] = None,
+        weights: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
@@ -654,6 +655,7 @@ class Runner:
                 rasterize_mode=rasterize_mode,
                 distributed=self.world_size > 1,
                 camera_model=self.cfg.camera_model,
+                weights=weights,
                 **kwargs,
             )
         except Exception as e:

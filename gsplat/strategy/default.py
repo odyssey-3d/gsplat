@@ -58,34 +58,34 @@ class DefaultStrategy(Strategy):
         return {"grad2d": None, "count": None, "scene_scale": scene_scale, "radii": None}
 
     def check_sanity(
-        self,
-        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-        optimizers: Dict[str, torch.optim.Optimizer],
+            self,
+            params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+            optimizers: Dict[str, torch.optim.Optimizer],
     ):
         super().check_sanity(params, optimizers)
         for key in ["means", "scales", "quats", "opacities"]:
             assert key in params, f"{key} is required in params but missing."
 
     def step_pre_backward(
-        self,
-        params: Dict[str, torch.nn.Parameter],
-        optimizers: Dict[str, torch.optim.Optimizer],
-        state: Dict[str, Any],
-        step: int,
-        info: Dict[str, Any],
+            self,
+            params: Dict[str, torch.nn.Parameter],
+            optimizers: Dict[str, torch.optim.Optimizer],
+            state: Dict[str, Any],
+            step: int,
+            info: Dict[str, Any],
     ):
         assert self.key_for_gradient in info, "Missing 2D means from info."
         info[self.key_for_gradient].retain_grad()
 
     def step_post_backward(
-        self,
-        params: Dict[str, torch.nn.Parameter],
-        optimizers: Dict[str, torch.optim.Optimizer],
-        state: Dict[str, Any],
-        step: int,
-        lr: float,
-        info: Dict[str, Any],
-        packed: bool = False,
+            self,
+            params: Dict[str, torch.nn.Parameter],
+            optimizers: Dict[str, torch.optim.Optimizer],
+            state: Dict[str, Any],
+            step: int,
+            lr: float,
+            info: Dict[str, Any],
+            packed: bool = False,
     ):
         self.binoms = self.binoms.to(params["means"].device)
         self._update_state(params, state, info, packed=packed)
@@ -128,11 +128,11 @@ class DefaultStrategy(Strategy):
                 state["radii"].zero_()
 
     def _update_state(
-        self,
-        params: Dict[str, torch.nn.Parameter],
-        state: Dict[str, Any],
-        info: Dict[str, Any],
-        packed: bool = False,
+            self,
+            params: Dict[str, torch.nn.Parameter],
+            state: Dict[str, Any],
+            info: Dict[str, Any],
+            packed: bool = False,
     ):
         for key in ["width", "height", "n_cameras", "radii", "gaussian_ids", self.key_for_gradient]:
             assert key in info, f"{key} is required but missing."
@@ -174,10 +174,10 @@ class DefaultStrategy(Strategy):
 
     @torch.no_grad()
     def _prune_gs(
-        self,
-        params: Dict[str, torch.nn.Parameter],
-        optimizers: Dict[str, torch.optim.Optimizer],
-        state: Dict[str, Any],
+            self,
+            params: Dict[str, torch.nn.Parameter],
+            optimizers: Dict[str, torch.optim.Optimizer],
+            state: Dict[str, Any],
     ) -> int:
         alpha = torch.sigmoid(params["opacities"])
         is_prune = alpha < self.prune_opa
@@ -186,13 +186,22 @@ class DefaultStrategy(Strategy):
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
         return n_prune
 
+    def importance_prune(
+            self,
+            params: Dict[str, torch.nn.Parameter],
+            optimizers: Dict[str, torch.optim.Optimizer],
+            state: Dict[str, Any],
+            mask,
+    ):
+        remove(params=params, optimizers=optimizers, state=state, mask=mask)
+
     @torch.no_grad()
     def _replace_pruned(
-        self,
-        params: Dict[str, torch.nn.Parameter],
-        optimizers: Dict[str, torch.optim.Optimizer],
-        state: Dict[str, torch.Tensor],
-        n_prune: int,
+            self,
+            params: Dict[str, torch.nn.Parameter],
+            optimizers: Dict[str, torch.optim.Optimizer],
+            state: Dict[str, torch.Tensor],
+            n_prune: int,
     ) -> int:
         """
         Replace pruned splats by sampling from alpha distribution of the remaining,
@@ -295,11 +304,11 @@ class DefaultStrategy(Strategy):
 
     @torch.no_grad()
     def _grow_gs(
-        self,
-        params: Dict[str, torch.nn.Parameter],
-        optimizers: Dict[str, torch.optim.Optimizer],
-        state: Dict[str, Any],
-        step: int,
+            self,
+            params: Dict[str, torch.nn.Parameter],
+            optimizers: Dict[str, torch.optim.Optimizer],
+            state: Dict[str, Any],
+            step: int,
     ) -> int:
         if step >= self.growth_stop_iter or len(params["means"]) >= self.max_count:
             return 0

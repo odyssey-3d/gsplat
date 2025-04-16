@@ -13,6 +13,23 @@ namespace cg = cooperative_groups;
 ////////////////////////////////////////////////////////////////
 // Forward
 ////////////////////////////////////////////////////////////////
+__device__ float atomicMaxFloat(float* address, float val) {
+    int* address_as_int = reinterpret_cast<int*>(address);  // Treat float as int
+    int old = *address_as_int;                              // Current value as int
+    int assumed;                                            // Temporary value for comparison
+    int new_val_as_int = __float_as_int(val);               // Convert new float to int bits
+
+    do {
+        assumed = old;
+        float assumed_float = __int_as_float(assumed);      // Convert current int to float
+        if (assumed_float >= val) {
+            return assumed_float;                           // No update needed
+        }
+        old = atomicCAS(address_as_int, assumed, new_val_as_int);
+    } while (assumed != old);                              // Retry on conflict
+
+    return __int_as_float(old);                            // Return old value as float
+}
 
 template <uint32_t CDIM, typename scalar_t>
 __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
@@ -36,7 +53,8 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     scalar_t
         *__restrict__ render_colors, // [C, image_height, image_width, CDIM]
     scalar_t *__restrict__ render_alphas, // [C, image_height, image_width, 1]
-    int32_t *__restrict__ last_ids        // [C, image_height, image_width]
+    int32_t *__restrict__ last_ids,        // [C, image_height, image_width]
+    scalar_t *__restrict__ weights
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -158,6 +176,9 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
 
             int32_t g = id_batch[t];
             const float vis = alpha * T;
+           if (weights) {
+                atomicMaxFloat(&weights[g], vis);
+            }
             const float *c_ptr = colors + g * CDIM;
 #pragma unroll
             for (uint32_t k = 0; k < CDIM; ++k) {
@@ -206,7 +227,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     // outputs
     at::Tensor renders, // [C, image_height, image_width, channels]
     at::Tensor alphas,  // [C, image_height, image_width]
-    at::Tensor last_ids // [C, image_height, image_width]
+    at::Tensor last_ids, // [C, image_height, image_width]
+    at::optional<at::Tensor> weights
 ) {
     bool packed = means2d.dim() == 2;
 
@@ -261,7 +283,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
             flatten_ids.data_ptr<int32_t>(),
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
-            last_ids.data_ptr<int32_t>()
+            last_ids.data_ptr<int32_t>(),
+            weights.has_value() ? weights.value().data_ptr<float>() : nullptr
         );
 }
 
@@ -283,7 +306,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         const at::Tensor flatten_ids,                                          \
         at::Tensor renders,                                                    \
         at::Tensor alphas,                                                     \
-        at::Tensor last_ids                                                    \
+        at::Tensor last_ids,                                                   \
+        at::optional<at::Tensor> weights                                       \
     );
 
 __INS__(1)
